@@ -35,6 +35,21 @@ const MAX_REPORT_LENGTH: usize = LONG_REPORT_LENGTH;
 /// budget can use [`HidppChannel::send_with_timeout`].
 pub const SEND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many times [`HidppChannel::send_and_forget`] retries a write that failed
+/// with a transient error (see [`is_transient_write_error`]) before surfacing
+/// it. Tuned for BLE-direct HID++: async-hid's per-write timeout is 250 ms, and
+/// Logitech BLE round-trips regularly exceed that on a marginal link, so a
+/// couple of retries recover a slow-but-healthy connection without noticeably
+/// delaying a genuinely broken one (each attempt is bounded by the 250 ms
+/// write timeout plus [`WRITE_TIMEOUT_RETRY_BACKOFF`]).
+pub const WRITE_TIMEOUT_RETRIES: u8 = 3;
+
+/// Backoff between transient-write retries in [`HidppChannel::send_and_forget`].
+/// Kept short: the goal is to let a momentarily-slow BLE link catch its breath,
+/// not to back off hard (a wedged device surfaces its error in well under a
+/// second total — `(3 retries × 250 ms) + (3 × 50 ms)`).
+pub const WRITE_TIMEOUT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
 /// The ID of the HID report that is used to transmit short HID++ messages.
 pub const SHORT_REPORT_ID: u8 = 0x10;
 
@@ -572,11 +587,33 @@ impl HidppChannel {
 
         let mut buf = [0u8; LONG_REPORT_LENGTH];
         let len = msg.write_raw(&mut buf);
-        self.raw_channel
-            .write_report(&buf[..len])
-            .await
-            .map(|_| ())
-            .map_err(ChannelError::Implementation)
+        // BLE-direct HID++ writes routinely exceed async-hid's 250 ms
+        // `IOHIDDeviceSetReportWithCallback` timeout (the error surfaces as
+        // `kIOReturnTimeout` / `0xE00002D6` stringified in a
+        // `ChannelError::Implementation`), so a single attempt fails on any
+        // marginal Bluetooth link. Retry transient write errors a bounded
+        // number of times with a short backoff before surfacing the failure —
+        // a slow-but-healthy link then succeeds within the retry budget while
+        // a genuinely broken one still reports an error promptly.
+        let mut last_err = None;
+        for attempt in 0..=WRITE_TIMEOUT_RETRIES {
+            if attempt > 0 {
+                futures_timer::Delay::new(WRITE_TIMEOUT_RETRY_BACKOFF).await;
+            }
+            match self.raw_channel.write_report(&buf[..len]).await {
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    if attempt < WRITE_TIMEOUT_RETRIES && is_transient_write_error(&*err) {
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(ChannelError::Implementation(err));
+                }
+            }
+        }
+        // Unreachable: the loop either returns Ok or Err on every path, but the
+        // compiler can't see that. The bound is the last transient error seen.
+        Err(ChannelError::Implementation(last_err.unwrap()))
     }
 
     /// Registers a listener that will be called for every incoming message.
@@ -622,6 +659,21 @@ impl HidppChannel {
             .remove(&hdl)
             .is_some()
     }
+}
+
+/// Classifies a raw HID write error as transient — i.e. worth retrying rather
+/// than surfacing immediately.
+///
+/// async-hid surfaces its macOS `IOHIDDeviceSetReportWithCallback` failures as
+/// a `Box<dyn Error>` whose `Display` string carries the IOKit return code in
+/// hex (e.g. `"report writer callback error: 0xE00002D6"`). There is no typed
+/// variant to match, so we match the hex of `kIOReturnTimeout` (`0xE00002D6`)
+/// in the error text. That code is what a BLE-direct HID++ write returns when
+/// the round-trip exceeds async-hid's 250 ms per-write budget — a slow-but-
+/// healthy link, not a fatal condition. Non-matching errors (disconnects, bad
+/// arguments, …) are treated as non-transient and surfaced at once.
+fn is_transient_write_error(err: &dyn Error) -> bool {
+    err.to_string().contains("0xE00002D6")
 }
 
 /// Represents an error that occurred when creating or interacting with a HID or
@@ -838,6 +890,63 @@ mod tests {
     }
 
     #[test]
+    fn is_transient_write_error_recognises_kioreturn_timeout() {
+        // The exact surface async-hid produces from a timed-out macOS write.
+        let timeout_err: Box<dyn Error + Sync + Send> =
+            "report writer callback error: 0xE00002D6".to_string().into();
+        assert!(super::is_transient_write_error(&*timeout_err));
+
+        // Unrelated errors are not transient.
+        let other_err: Box<dyn Error + Sync + Send> = "disconnected".to_string().into();
+        assert!(!super::is_transient_write_error(&*other_err));
+    }
+
+    /// Regression: a BLE-direct HID++ write that times out a few times before
+    /// succeeding must not surface an error — `send_and_forget` retries
+    /// transient (kIOReturnTimeout) failures within `WRITE_TIMEOUT_RETRIES`.
+    #[test]
+    fn send_and_forget_retries_transient_write_timeouts() {
+        futures::executor::block_on(async {
+            let (raw, handle) = MockRawHidChannel::new();
+            // Script the first 2 writes to time out; the 3rd succeeds. With
+            // WRITE_TIMEOUT_RETRIES = 3 this stays within budget.
+            handle.fail_next_writes_with_timeout(2);
+            let channel = HidppChannel::from_raw_channel(raw).await.unwrap();
+
+            channel.send_and_forget(short_msg(0x10)).await.unwrap();
+
+            // The retried attempts all reach the mock (it records every call);
+            // only the successful one is counted as a written report.
+            assert_eq!(
+                handle.written_reports().len(),
+                1,
+                "the message is written exactly once on success"
+            );
+            assert_pending_empty(&channel);
+        });
+    }
+
+    /// A write that times out more than `WRITE_TIMEOUT_RETRIES` times surfaces
+    /// the error rather than looping forever.
+    #[test]
+    fn send_and_forget_surfaces_error_after_exhausting_retries() {
+        futures::executor::block_on(async {
+            let (raw, handle) = MockRawHidChannel::new();
+            // More transient failures than retries allow — must surface the err.
+            handle.fail_next_writes_with_timeout(WRITE_TIMEOUT_RETRIES + 2);
+            let channel = HidppChannel::from_raw_channel(raw).await.unwrap();
+
+            let result = channel.send_and_forget(short_msg(0x10)).await;
+            assert!(
+                result.is_err(),
+                "exhausting the retry budget surfaces the write error"
+            );
+            // Nothing was successfully written.
+            assert_eq!(handle.written_reports().len(), 0);
+        });
+    }
+
+    #[test]
     fn listener_can_remove_another_listener_during_dispatch() {
         futures::executor::block_on(async {
             let (raw, handle) = MockRawHidChannel::new();
@@ -873,6 +982,7 @@ mod tests {
         incoming_tx: async_channel::Sender<Vec<u8>>,
         written_reports: Arc<Mutex<Vec<Vec<u8>>>>,
         responses_on_write: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        remaining_timeout_failures: Arc<Mutex<u8>>,
     }
 
     impl MockRawHidHandle {
@@ -890,6 +1000,13 @@ mod tests {
         fn written_reports(&self) -> Vec<Vec<u8>> {
             self.written_reports.lock().unwrap().clone()
         }
+
+        /// Script the next `n` `write_report` calls to fail with the same
+        /// transient (kIOReturnTimeout) error async-hid surfaces from a timed-
+        /// out BLE write, then succeed.
+        fn fail_next_writes_with_timeout(&self, n: u8) {
+            *self.remaining_timeout_failures.lock().unwrap() = n;
+        }
     }
 
     struct MockRawHidChannel {
@@ -897,6 +1014,10 @@ mod tests {
         incoming_rx: async_channel::Receiver<Vec<u8>>,
         written_reports: Arc<Mutex<Vec<Vec<u8>>>>,
         responses_on_write: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        /// How many subsequent `write_report` calls should fail with a
+        /// transient (kIOReturnTimeout) error before succeeding. Drives the
+        /// write-retry test.
+        remaining_timeout_failures: Arc<Mutex<u8>>,
     }
 
     impl MockRawHidChannel {
@@ -904,11 +1025,13 @@ mod tests {
             let (incoming_tx, incoming_rx) = async_channel::unbounded();
             let written_reports = Arc::new(Mutex::new(Vec::new()));
             let responses_on_write = Arc::new(Mutex::new(VecDeque::new()));
+            let remaining_timeout_failures = Arc::new(Mutex::new(0u8));
 
             let handle = MockRawHidHandle {
                 incoming_tx: incoming_tx.clone(),
                 written_reports: Arc::clone(&written_reports),
                 responses_on_write: Arc::clone(&responses_on_write),
+                remaining_timeout_failures: Arc::clone(&remaining_timeout_failures),
             };
 
             (
@@ -917,6 +1040,7 @@ mod tests {
                     incoming_rx,
                     written_reports,
                     responses_on_write,
+                    remaining_timeout_failures,
                 },
                 handle,
             )
@@ -934,6 +1058,24 @@ mod tests {
         }
 
         async fn write_report(&self, src: &[u8]) -> Result<usize, Box<dyn Error + Sync + Send>> {
+            // Consume a scripted transient failure, if any remain. The error
+            // string mirrors async-hid's real macOS surface: the IOKit return
+            // code hex inside a `report writer callback error` message.
+            let fail = {
+                let mut remaining = self.remaining_timeout_failures.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if fail {
+                return Err(Box::<dyn Error + Sync + Send>::from(
+                    "report writer callback error: 0xE00002D6".to_string(),
+                ));
+            }
+
             self.written_reports.lock().unwrap().push(src.to_vec());
             let response = self.responses_on_write.lock().unwrap().pop_front();
             if let Some(response) = response {
