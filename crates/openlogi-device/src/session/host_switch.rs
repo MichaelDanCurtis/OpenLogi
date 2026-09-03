@@ -181,6 +181,21 @@ pub async fn switch_linked_hosts(
     host: u8,
     channel_pool: &ChannelPool,
 ) -> Result<bool, HostSwitchError> {
+    switch_linked_hosts_with(keyboard, targets, host, channel_pool, || {}).await
+}
+
+/// [`switch_linked_hosts`], calling `on_validated` once the keyboard's own move
+/// has been validated — the slot is inside the host count, paired, and not the
+/// current one — and before any device is moved. Hooks that must fire the
+/// instant a switch is certain (the agent's `host_switch_actions`) hang off
+/// this; a switch that turns out to be a no-op never reaches it.
+pub async fn switch_linked_hosts_with(
+    keyboard: &DeviceRoute,
+    targets: &[DeviceRoute],
+    host: u8,
+    channel_pool: &ChannelPool,
+    on_validated: impl FnOnce(),
+) -> Result<bool, HostSwitchError> {
     let channel = open_channel(channel_pool, keyboard, "opening keyboard channel")
         .await?
         .ok_or(HostSwitchError::KeyboardNotFound)?;
@@ -191,6 +206,9 @@ pub async fn switch_linked_hosts(
     // the keyboard leaves this host its channel can no longer command a mouse
     // sharing the same receiver.
     let keyboard_change = prepare_host_change_on(&channel, keyboard.device_index(), host).await?;
+    if keyboard_change.required {
+        on_validated();
+    }
     for target in targets {
         match prepare_host_change(target, host, keyboard, &channel, channel_pool).await {
             Ok(change) => {
@@ -791,6 +809,16 @@ mod tests {
             host_change_required(0, 2, 2).is_err(),
             "host 2 is outside a device that reports 2 hosts and must be rejected"
         );
+    }
+
+    #[test]
+    fn validated_callback_fires_only_when_a_move_is_required() {
+        assert!(matches!(super::host_change_required(0, 3, 1), Ok(true)));
+        assert!(matches!(super::host_change_required(1, 3, 1), Ok(false)));
+        assert!(matches!(
+            super::host_change_required(0, 3, 3),
+            Err(super::HostSwitchError::Hidpp(_))
+        ));
     }
 
     #[test]
