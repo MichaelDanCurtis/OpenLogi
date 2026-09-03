@@ -727,6 +727,35 @@ mod tests {
         assert!(!change.required);
     }
 
+    #[tokio::test]
+    async fn callback_does_not_fire_when_keyboard_cannot_be_opened() {
+        // Negative test: keyboard not found should never call the callback,
+        // even if it were ready to validate.
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let callback_called = StdArc::new(AtomicBool::new(false));
+        let callback_called_clone = StdArc::clone(&callback_called);
+        let backend = crate::channel::scripted::ScriptedBackend::new(vec![]);
+        let pool = crate::ChannelPool::with_backend(backend);
+
+        let keyboard = DeviceRoute::Direct {
+            vendor_id: 0x046d,
+            product_id: 0xc539,
+        };
+
+        let result = super::switch_linked_hosts_with(&keyboard, &[], 1, &pool, move || {
+            callback_called_clone.store(true, Ordering::Release);
+        })
+        .await;
+
+        assert!(matches!(result, Err(HostSwitchError::KeyboardNotFound)));
+        assert!(
+            !callback_called.load(Ordering::Acquire),
+            "callback must not fire when keyboard cannot be opened"
+        );
+    }
+
     /// A reporting snapshot with unrelated bits deliberately set, so the
     /// cleanup tests prove that only the bits they vary are restored.
     fn noisy_reporting() -> CidReporting {
