@@ -261,6 +261,23 @@ impl ActionDispatcher {
         self.executor.dispatch(action, device_key);
     }
 
+    /// Route one hook-fired action. Script actions run through
+    /// [`openlogi_inject::execute_with_env`] so the child process sees `env`
+    /// (the host-switch slot, device key, and trigger); every other action is
+    /// dispatched exactly as [`Self::dispatch`] would.
+    pub fn dispatch_hook(
+        &self,
+        action: &Action,
+        device_key: Option<&str>,
+        env: &[(String, String)],
+    ) {
+        if carries_hook_env(action) {
+            openlogi_inject::execute_with_env(action, env);
+        } else {
+            self.dispatch(action, device_key);
+        }
+    }
+
     /// Queue one OS-hook down edge without blocking the callback. The returned
     /// token uniquely identifies this accepted press.
     pub(crate) fn try_hook_button_down(
@@ -373,6 +390,14 @@ fn browser_nav_debounce_ok(action: &Action) -> bool {
     fire
 }
 
+/// Whether `action` spawns a child process that can receive hook environment.
+fn carries_hook_env(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::RunShellCommand(_) | Action::RunAppleScript(_) | Action::Workflow(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +409,19 @@ mod tests {
 
         assert!(!held.start(&press, &Action::Copy));
         held.end(&press);
+    }
+
+    #[test]
+    fn script_actions_are_the_only_env_carrying_kind() {
+        use openlogi_core::binding::WorkflowStep;
+        assert!(super::carries_hook_env(&Action::RunShellCommand(
+            "x".into()
+        )));
+        assert!(super::carries_hook_env(&Action::RunAppleScript("x".into())));
+        assert!(super::carries_hook_env(&Action::Workflow(vec![
+            WorkflowStep::Delay { millis: 1 }
+        ])));
+        assert!(!super::carries_hook_env(&Action::Copy));
+        assert!(!super::carries_hook_env(&Action::ShowActionsRing));
     }
 }
