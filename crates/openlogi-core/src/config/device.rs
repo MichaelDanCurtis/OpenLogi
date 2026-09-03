@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::host_switch::HostSwitchActions;
 use super::settings::{
     CameraControls, GestureOwner, LightSettings, Lighting, ScrollResolution, SmartShift,
     ThumbwheelSensitivity, deserialize_gesture_owner,
@@ -264,6 +265,10 @@ pub struct DeviceConfig {
     /// lets the keyboard leave the current host.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_switch_targets: Vec<String>,
+    /// Actions fired around this keyboard's host switching; see
+    /// [`HostSwitchActions`]. Omitted from `config.toml` while empty.
+    #[serde(default, skip_serializing_if = "HostSwitchActions::is_empty")]
+    pub host_switch_actions: HostSwitchActions,
     /// Keyboard Fn-lock state (HID++ fn inversion, `0x40a2`/`0x40a3`): `true`
     /// means the F-row sends F1–F12 without holding Fn. The state lives in
     /// device RAM per host, so the agent re-applies it on reconnect like
@@ -369,6 +374,7 @@ impl Default for DeviceConfig {
             invert_scroll: false,
             scroll_resolution: None,
             host_switch_targets: Vec::new(),
+            host_switch_actions: HostSwitchActions::default(),
             fn_lock: None,
         }
     }
@@ -489,6 +495,8 @@ struct RawDeviceConfig {
     #[serde(default)]
     host_switch_targets: Vec<String>,
     #[serde(default)]
+    host_switch_actions: HostSwitchActions,
+    #[serde(default)]
     fn_lock: Option<bool>,
     #[serde(default = "default_true")]
     enabled: bool,
@@ -549,6 +557,7 @@ impl From<RawDeviceConfig> for DeviceConfig {
             invert_scroll: raw.invert_scroll,
             scroll_resolution: raw.scroll_resolution,
             host_switch_targets: raw.host_switch_targets,
+            host_switch_actions: raw.host_switch_actions,
             fn_lock: raw.fn_lock,
         }
     }
@@ -573,6 +582,36 @@ mod tests {
         );
         let serialized = toml::to_string(&config)?;
         assert!(serialized.contains("host_switch_targets"));
+        Ok(())
+    }
+
+    #[test]
+    fn host_switch_actions_round_trip_and_stay_absent_when_empty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config: DeviceConfig = toml::from_str(
+            r#"host_switch_targets = ["unit:mouse"]
+
+[host_switch_actions]
+slot_2 = { RunShellCommand = "/usr/local/bin/deskswitch switch --slot 2" }
+"#,
+        )?;
+        assert_eq!(
+            config.host_switch_actions.slot_2,
+            Some(crate::binding::Action::RunShellCommand(
+                "/usr/local/bin/deskswitch switch --slot 2".into()
+            ))
+        );
+        let serialized = toml::to_string(&config)?;
+        // The TOML serializer produces [host_switch_actions.slot_2] for nested tables,
+        // not [host_switch_actions] as a standalone section, but the section exists.
+        assert!(serialized.contains("[host_switch_actions"));
+
+        let plain: DeviceConfig = toml::from_str(r#"host_switch_targets = ["unit:mouse"]"#)?;
+        assert!(plain.host_switch_actions.is_empty());
+        assert!(
+            !toml::to_string(&plain)?.contains("host_switch_actions"),
+            "an empty table must not appear in config.toml"
+        );
         Ok(())
     }
 }
