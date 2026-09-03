@@ -416,6 +416,39 @@ fn host_switch_links_keep_sleeping_targets_but_require_online_keyboard() {
 }
 
 #[test]
+fn host_switch_links_exist_for_actions_only_keyboards_and_carry_the_actions() {
+    let mut config = Config::default();
+    config
+        .devices
+        .entry("keyboard".into())
+        .or_default()
+        .host_switch_actions
+        .slot_2 = Some(Action::RunShellCommand("deskswitch switch --slot 2".into()));
+    let devices = [dev("keyboard", 1, true)];
+
+    let links = host_switch_links(&config, &devices);
+
+    assert_eq!(links.len(), 1, "actions alone must arm a divert session");
+    assert_eq!(links[0].keyboard_key, "keyboard");
+    assert!(links[0].targets.is_empty());
+    assert_eq!(
+        links[0].actions.for_host_index(1),
+        Some(&Action::RunShellCommand(
+            "deskswitch switch --slot 2".into()
+        ))
+    );
+}
+
+#[test]
+fn host_switch_links_skip_keyboards_with_neither_targets_nor_actions() {
+    let mut config = Config::default();
+    config.devices.entry("keyboard".into()).or_default();
+    let devices = [dev("keyboard", 1, true)];
+
+    assert!(host_switch_links(&config, &devices).is_empty());
+}
+
+#[test]
 fn reapply_targets_new_arrivals_and_transitions() {
     // First sighting of an online device → re-apply.
     assert_eq!(reapply_targets(&[], &[dev("a", 1, true)], false), vec![0]);

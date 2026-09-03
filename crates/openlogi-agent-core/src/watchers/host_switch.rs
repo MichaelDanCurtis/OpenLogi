@@ -3,6 +3,7 @@
 use std::thread;
 use std::time::Duration;
 
+use openlogi_core::config::HostSwitchActions;
 use openlogi_hid::{
     ChannelPool, DeviceIoGate, DeviceRoute, HostSwitchStopReason, run_host_switch_session,
     switch_linked_hosts,
@@ -20,10 +21,15 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// orchestrator so the transport watcher never needs to understand inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostSwitchLink {
+    /// The keyboard's config key, handed to hook actions as
+    /// `OPENLOGI_DEVICE_KEY`.
+    pub keyboard_key: String,
     /// Keyboard whose host switch keys initiate the transition.
     pub keyboard: DeviceRoute,
     /// Pointing devices that follow the keyboard.
     pub targets: Vec<DeviceRoute>,
+    /// Actions fired around the transition.
+    pub actions: HostSwitchActions,
 }
 
 /// Read-only, lossless, coalescing view of resolved links.
@@ -369,8 +375,10 @@ mod tests {
         let mut state = HostSwitchManagerState::new();
         state.restart_after.push((
             HostSwitchLink {
+                keyboard_key: "keyboard".into(),
                 keyboard: route(1),
                 targets: vec![route(2)],
+                actions: HostSwitchActions::default(),
             },
             retry_at,
         ));
@@ -390,8 +398,10 @@ mod tests {
     async fn departure_publication_finishes_wait_without_advancing_time() {
         let keyboard = route(1);
         let link = HostSwitchLink {
+            keyboard_key: "keyboard".into(),
             keyboard: keyboard.clone(),
             targets: vec![route(2)],
+            actions: HostSwitchActions::default(),
         };
         let (links, mut published) = watch::channel(std::sync::Arc::new(vec![link]));
         let started = Instant::now();

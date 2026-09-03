@@ -1042,7 +1042,16 @@ fn host_switch_links(config: &Config, devices: &[AgentDevice]) -> Vec<HostSwitch
                         .and_then(|device| device.route.clone())
                 })
                 .collect::<Vec<_>>();
-            (!targets.is_empty()).then_some(HostSwitchLink { keyboard, targets })
+            // A keyboard with actions but no linked mouse still needs the divert
+            // session: the actions are what observe the pressed slot.
+            (!targets.is_empty() || !settings.host_switch_actions.is_empty()).then(|| {
+                HostSwitchLink {
+                    keyboard_key: keyboard_key.clone(),
+                    keyboard,
+                    targets,
+                    actions: settings.host_switch_actions.clone(),
+                }
+            })
         })
         .collect()
 }
