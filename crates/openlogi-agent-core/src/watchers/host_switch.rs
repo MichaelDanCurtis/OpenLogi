@@ -3,16 +3,18 @@
 use std::thread;
 use std::time::Duration;
 
-use openlogi_core::config::HostSwitchActions;
+use openlogi_core::binding::Action;
+use openlogi_core::config::{HostSwitchActions, HostSwitchTrigger};
 use openlogi_hid::{
     ChannelPool, DeviceIoGate, DeviceRoute, HostSwitchStopReason, run_host_switch_session,
-    switch_linked_hosts,
+    switch_linked_hosts_with,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::receiver_access::{ExclusiveAccessReason, ReceiverAccess, ReceiverRequestState};
+use crate::runtime::ActionDispatcher;
 
 const DEPARTURE_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -41,6 +43,7 @@ pub fn spawn(
     channel_pool: ChannelPool,
     receiver_access: ReceiverAccess,
     device_io: DeviceIoGate,
+    dispatcher: ActionDispatcher,
 ) {
     let links = links.clone();
     let receiver_requests = receiver_access.subscribe_requests();
@@ -61,6 +64,7 @@ pub fn spawn(
             receiver_access,
             receiver_requests,
             device_io,
+            dispatcher,
         ));
     });
 }
@@ -147,6 +151,7 @@ async fn manage(
     receiver_access: ReceiverAccess,
     mut receiver_requests: watch::Receiver<ReceiverRequestState>,
     mut device_io: DeviceIoGate,
+    dispatcher: ActionDispatcher,
 ) {
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<SessionCompletion>();
     let mut state = HostSwitchManagerState::new();
@@ -196,8 +201,10 @@ async fn manage(
                             &mut links,
                             &channel_pool,
                             &receiver_access,
+                            &dispatcher,
                             link,
                             host,
+                            HostSwitchTrigger::Key,
                         )
                         .await;
                     } else if device_io.allows_io() {
@@ -315,19 +322,54 @@ async fn run_transition(
     links: &mut watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>,
     channel_pool: &ChannelPool,
     receiver_access: &ReceiverAccess,
+    dispatcher: &ActionDispatcher,
     link: HostSwitchLink,
     host: u8,
+    trigger: HostSwitchTrigger,
 ) {
     let _lease = receiver_access
         .acquire_exclusive(ExclusiveAccessReason::HostTransition)
         .await;
-    match switch_linked_hosts(&link.keyboard, &link.targets, host, channel_pool).await {
+    let fire = || {
+        if !fire_slot_action(dispatcher, &link, host, trigger) {
+            debug!(host, route = %link.keyboard, "no host switch action configured for slot");
+        }
+    };
+    match switch_linked_hosts_with(&link.keyboard, &link.targets, host, channel_pool, fire).await {
         Ok(true) => wait_for_departure(links, &link.keyboard).await,
         Ok(false) => {}
         Err(error) => {
             debug!(%error, route = %link.keyboard, host, "keyboard host switch failed");
         }
     }
+}
+
+/// The action and environment for a switch of `link`'s keyboard to 0-based
+/// `host`, or `None` when that slot has no action configured.
+fn plan_slot_action(
+    link: &HostSwitchLink,
+    host: u8,
+    trigger: HostSwitchTrigger,
+) -> Option<(&Action, Vec<(String, String)>)> {
+    let action = link.actions.for_host_index(host)?;
+    Some((action, trigger.hook_env(&link.keyboard_key, Some(host))))
+}
+
+/// Fire the configured slot action, fire-and-forget. Returns whether one was
+/// configured. Never awaited by the transition: the dispatcher hands script
+/// actions to a worker thread and returns immediately.
+fn fire_slot_action(
+    dispatcher: &ActionDispatcher,
+    link: &HostSwitchLink,
+    host: u8,
+    trigger: HostSwitchTrigger,
+) -> bool {
+    let Some((action, env)) = plan_slot_action(link, host, trigger) else {
+        return false;
+    };
+    debug!(host, route = %link.keyboard, trigger = trigger.as_str(), "firing host switch action");
+    dispatcher.dispatch_hook(action, Some(&link.keyboard_key), &env);
+    true
 }
 
 async fn wait_for_departure(
@@ -419,5 +461,31 @@ mod tests {
             started,
             "the link publication should reconcile departure immediately"
         );
+    }
+
+    #[test]
+    fn slot_action_env_names_the_keyboard_and_one_based_slot() {
+        let link = HostSwitchLink {
+            keyboard_key: "unit:7b520554".into(),
+            keyboard: route(1),
+            targets: Vec::new(),
+            actions: HostSwitchActions {
+                slot_3: Some(openlogi_core::binding::Action::RunShellCommand("x".into())),
+                ..HostSwitchActions::default()
+            },
+        };
+        let (action, env) =
+            plan_slot_action(&link, 2, HostSwitchTrigger::Key).expect("slot 3 is configured");
+        assert_eq!(
+            action,
+            &openlogi_core::binding::Action::RunShellCommand("x".into())
+        );
+        assert!(env.contains(&("OPENLOGI_HOST_SLOT".to_string(), "3".to_string())));
+        assert!(env.contains(&(
+            "OPENLOGI_DEVICE_KEY".to_string(),
+            "unit:7b520554".to_string()
+        )));
+        assert!(env.contains(&("OPENLOGI_TRIGGER".to_string(), "key".to_string())));
+        assert!(plan_slot_action(&link, 0, HostSwitchTrigger::Key).is_none());
     }
 }

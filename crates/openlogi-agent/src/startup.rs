@@ -187,6 +187,7 @@ pub(crate) fn spawn_hidpp_watchers(shared: &SharedRuntime, inputs: &InputService
         shared.channel_pool.clone(),
         shared.receiver_access.clone(),
         shared.device_io.clone(),
+        inputs.dispatcher.clone(),
     );
     watchers::keyboard::spawn(
         &shared.keyboard_spec,
