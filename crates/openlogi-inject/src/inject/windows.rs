@@ -53,7 +53,7 @@ const XBUTTON2: i32 = 2;
 /// synthesise events via `SendInput`. macOS window-manager actions map to
 /// their Windows equivalents; `CustomShortcut` maps macOS `kVK_*` codes to
 /// Windows virtual-key codes (Cmd → Ctrl).
-pub(super) fn execute(action: &Action) {
+pub(super) fn execute(action: &Action, env: &[(String, String)]) {
     match action.effect() {
         Effect::None => {}
         Effect::Click(button) => post_click(button),
@@ -62,7 +62,7 @@ pub(super) fn execute(action: &Action) {
         Effect::Scroll { dx, dy } => dispatch_scroll(dx, dy),
         Effect::Media(key) => dispatch_media(key),
         Effect::Native(native) => dispatch_native(native),
-        Effect::Script(script) => dispatch_script(script),
+        Effect::Script(script) => dispatch_script(script, env),
         Effect::Text(text) => {
             tracing::warn!(
                 chars = text.chars().count(),
@@ -160,25 +160,25 @@ fn dispatch_media(key: MediaKey) {
     }
 }
 
-fn dispatch_script(script: Script<'_>) {
+fn dispatch_script(script: Script<'_>, env: &[(String, String)]) {
     match script {
         Script::AppleScript(_) => {
             tracing::warn!("RunAppleScript is only supported on macOS");
         }
-        Script::ShellCommand(cmd) => run_shell_command_async(cmd.to_string()),
-        Script::Workflow(steps) => run_workflow_async(steps.to_vec()),
+        Script::ShellCommand(cmd) => run_shell_command_async(cmd.to_string(), env.to_vec()),
+        Script::Workflow(steps) => run_workflow_async(steps.to_vec(), env.to_vec()),
     }
 }
 
-fn run_shell_command_async(cmd: String) {
-    std::thread::spawn(move || run_shell_command(&cmd));
+fn run_shell_command_async(cmd: String, env: Vec<(String, String)>) {
+    std::thread::spawn(move || run_shell_command(&cmd, &env));
 }
 
-fn run_workflow_async(steps: Vec<WorkflowStep>) {
-    std::thread::spawn(move || run_workflow(&steps));
+fn run_workflow_async(steps: Vec<WorkflowStep>, env: Vec<(String, String)>) {
+    std::thread::spawn(move || run_workflow(&steps, &env));
 }
 
-fn run_workflow(steps: &[WorkflowStep]) {
+fn run_workflow(steps: &[WorkflowStep], env: &[(String, String)]) {
     for step in steps {
         match step {
             WorkflowStep::TypeText(text) => {
@@ -194,13 +194,16 @@ fn run_workflow(steps: &[WorkflowStep]) {
             WorkflowStep::RunAppleScript(_) => {
                 tracing::warn!("workflow RunAppleScript is only supported on macOS");
             }
-            WorkflowStep::RunShellCommand(cmd) => run_shell_command(cmd),
+            WorkflowStep::RunShellCommand(cmd) => run_shell_command(cmd, env),
         }
     }
 }
 
-fn run_shell_command(cmd: &str) {
-    let _ = std::process::Command::new("cmd").args(["/C", cmd]).output();
+fn run_shell_command(cmd: &str, env: &[(String, String)]) {
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", cmd])
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .output();
 }
 
 fn post_click(button: MouseButton) {

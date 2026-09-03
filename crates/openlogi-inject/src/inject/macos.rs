@@ -40,7 +40,7 @@ const NX_KEYTYPE_PREVIOUS: i32 = 18;
 
 /// macOS implementation: classify `action` into an [`Effect`] and dispatch
 /// to the appropriate event helper.
-pub(super) fn execute(action: &Action) {
+pub(super) fn execute(action: &Action, env: &[(String, String)]) {
     match action.effect() {
         // Suppressed input: captured but deliberately produces no event.
         Effect::None => {}
@@ -56,7 +56,7 @@ pub(super) fn execute(action: &Action) {
         // CGEventCreateKeyboardEvent is ignored by macOS' volume handler.
         Effect::Media(key) => post_media_key(nx_key(key)),
         Effect::Native(native) => dispatch_native(native),
-        Effect::Script(script) => dispatch_script(script),
+        Effect::Script(script) => dispatch_script(script, env),
         // TypeText emits a unicode string, layout-independent.
         Effect::Text(text) => post_unicode(text),
         Effect::AgentSide => {
@@ -163,11 +163,11 @@ fn nx_key(key: MediaKey) -> i32 {
 /// All three spawn off the tap thread: the callback must not block (posting
 /// a key while waiting on a child process, or sleeping through a workflow
 /// `Delay`, would wedge input).
-fn dispatch_script(script: Script<'_>) {
+fn dispatch_script(script: Script<'_>, env: &[(String, String)]) {
     match script {
-        Script::AppleScript(src) => run_apple_script_async(src.to_string()),
-        Script::ShellCommand(cmd) => run_shell_command_async(cmd.to_string()),
-        Script::Workflow(steps) => run_workflow_async(steps.to_vec()),
+        Script::AppleScript(src) => run_apple_script_async(src.to_string(), env.to_vec()),
+        Script::ShellCommand(cmd) => run_shell_command_async(cmd.to_string(), env.to_vec()),
+        Script::Workflow(steps) => run_workflow_async(steps.to_vec(), env.to_vec()),
     }
 }
 
@@ -497,20 +497,20 @@ mod tests {
     }
 }
 
-fn run_apple_script_async(src: String) {
-    std::thread::spawn(move || run_apple_script(&src));
+fn run_apple_script_async(src: String, env: Vec<(String, String)>) {
+    std::thread::spawn(move || run_apple_script(&src, &env));
 }
 
-fn run_shell_command_async(cmd: String) {
-    std::thread::spawn(move || run_shell_command(&cmd));
+fn run_shell_command_async(cmd: String, env: Vec<(String, String)>) {
+    std::thread::spawn(move || run_shell_command(&cmd, &env));
 }
 
-fn run_workflow_async(steps: Vec<WorkflowStep>) {
-    std::thread::spawn(move || run_workflow(&steps));
+fn run_workflow_async(steps: Vec<WorkflowStep>, env: Vec<(String, String)>) {
+    std::thread::spawn(move || run_workflow(&steps, &env));
 }
 
 /// Run workflow steps on a worker thread, so `Delay` never stalls the event tap.
-fn run_workflow(steps: &[WorkflowStep]) {
+fn run_workflow(steps: &[WorkflowStep], env: &[(String, String)]) {
     for step in steps {
         match step {
             WorkflowStep::TypeText(text) => post_unicode(text),
@@ -518,21 +518,23 @@ fn run_workflow(steps: &[WorkflowStep]) {
             WorkflowStep::Delay { millis } => {
                 std::thread::sleep(std::time::Duration::from_millis(*millis));
             }
-            WorkflowStep::RunAppleScript(src) => run_apple_script(src),
-            WorkflowStep::RunShellCommand(cmd) => run_shell_command(cmd),
+            WorkflowStep::RunAppleScript(src) => run_apple_script(src, env),
+            WorkflowStep::RunShellCommand(cmd) => run_shell_command(cmd, env),
         }
     }
 }
 
-fn run_apple_script(src: &str) {
+fn run_apple_script(src: &str, env: &[(String, String)]) {
     let _ = std::process::Command::new("osascript")
         .args(["-e", src])
+        .envs(env.iter().map(|(name, value)| (name, value)))
         .output();
 }
 
-fn run_shell_command(cmd: &str) {
+fn run_shell_command(cmd: &str, env: &[(String, String)]) {
     let _ = std::process::Command::new("/bin/sh")
         .args(["-c", cmd])
+        .envs(env.iter().map(|(name, value)| (name, value)))
         .output();
 }
 

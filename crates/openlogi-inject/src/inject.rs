@@ -207,6 +207,14 @@ fn held_keys(combo: &KeyCombo) -> Vec<HeldKey> {
 /// bind a button to any action in the GUI and confirm the expected system event
 /// fires when the button is pressed (or use the `inject_action` example).
 pub fn execute(action: &Action) {
+    execute_with_env(action, &[]);
+}
+
+/// Like [`execute`], but script actions (`RunShellCommand`, `RunAppleScript`,
+/// `Workflow`) run with `env` added to the child process environment. The
+/// agent's host-switch hooks use this to hand a script the slot, device key,
+/// and trigger; every other action ignores `env`.
+pub fn execute_with_env(action: &Action, env: &[(String, String)]) {
     if let Action::OpenApplication(target) = action {
         let expanded = shellexpand::tilde(target.path());
         if let Err(error) = opener::open(expanded.as_ref()) {
@@ -221,15 +229,16 @@ pub fn execute(action: &Action) {
 
     cfg_select! {
         target_os = "macos" => {
-            macos::execute(action);
+            macos::execute(action, env);
         }
         target_os = "linux" => {
-            linux::execute(action);
+            linux::execute(action, env);
         }
         target_os = "windows" => {
-            windows::execute(action);
+            windows::execute(action, env);
         }
         _ => {
+            let _ = env;
             tracing::warn!(
                 action = action.label(),
                 "execute unsupported on this platform"
