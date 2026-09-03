@@ -29,7 +29,7 @@ use openlogi_agent_core::orchestrator::{Orchestrator, SharedRuntime};
 use openlogi_agent_core::runtime::hook;
 use openlogi_agent_core::watchers::foreground_app::ForegroundUpdate;
 use openlogi_agent_core::watchers::inventory::{InventoryEvent, InventoryRefresh};
-use openlogi_core::config::Config;
+use openlogi_core::config::{Config, HostSwitchTrigger};
 use openlogi_hook::Hook;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -347,9 +347,19 @@ impl Running {
                 hid_open_failures,
             } => {
                 let mut orchestrator = self.orchestrator.lock().await;
-                orchestrator.refresh_inventory(&inventories, &standalone, hid_open_failures);
+                let arrivals =
+                    orchestrator.refresh_inventory(&inventories, &standalone, hid_open_failures);
                 let confirm_settings = orchestrator.needs_reapply_confirmation();
                 drop(orchestrator);
+                for arrival in arrivals {
+                    let env = HostSwitchTrigger::Arrive.hook_env(&arrival.keyboard_key, None);
+                    info!(keyboard = %arrival.keyboard_key, "keyboard arrived — firing arrive action");
+                    self.inputs.dispatcher.dispatch_hook(
+                        &arrival.action,
+                        Some(&arrival.keyboard_key),
+                        &env,
+                    );
+                }
                 if confirm_settings {
                     refresh.request_settings_confirmation();
                 }

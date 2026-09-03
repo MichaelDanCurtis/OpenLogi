@@ -43,6 +43,15 @@ use crate::watchers::host_switch::{HostSwitchLink, HostSwitchLinks};
 use crate::watchers::keyboard::{KeyboardSpec, SharedKeyboardSpec};
 use crate::{DpiCycleState, DpiCycles};
 
+/// A keyboard that just connected to this host and has an `arrive` action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostArrival {
+    /// The keyboard's config key (`OPENLOGI_DEVICE_KEY`).
+    pub keyboard_key: String,
+    /// The configured `arrive` action.
+    pub action: Action,
+}
+
 /// The minimal per-device facts the agent needs: the config key (binding /
 /// preset lookup), the HID++ route (DPI/SmartShift writes + capture target), and
 /// the identity fields the canonical ordering keys on (so the no-selection
@@ -481,7 +490,10 @@ impl Orchestrator {
         inventories: &[DeviceInventory],
         standalone: &[StandaloneDevice],
         hid_open_failures: bool,
-    ) {
+    ) -> Vec<HostArrival> {
+        // An `arrive` edge needs a previous completed snapshot to compare
+        // against; the first reconcile is a baseline, never an edge.
+        let had_baseline = matches!(self.inventory, InventoryState::Ready { .. });
         // Even an empty snapshot is a *completed* enumeration — the watcher
         // skips failed ticks — so the device set is now known either way (and
         // a recovered backend upgrades `Unavailable` back to live data).
@@ -492,6 +504,11 @@ impl Orchestrator {
         };
         self.publish_inventory();
         let devices = build_devices(&self.config, inventories, standalone);
+        let arrivals = if had_baseline {
+            host_arrivals(&self.config, &self.devices, &devices)
+        } else {
+            Vec::new()
+        };
         // Volatile settings (lighting colour, sensor DPI, SmartShift, native
         // wheel mode) live in device RAM and reset on a power cycle. Every
         // reconnect shape re-applies the persisted values (#189): a first
@@ -533,11 +550,12 @@ impl Orchestrator {
             // also lands through this republish.
             self.devices = devices;
             self.publish_device_runtime();
-            return;
+            return arrivals;
         }
         self.devices = devices;
         self.current = next_current;
         self.rebuild();
+        arrivals
     }
 
     /// Whether volatile-setting writes still need a delayed inventory pass to
@@ -1051,6 +1069,29 @@ fn host_switch_links(config: &Config, devices: &[AgentDevice]) -> Vec<HostSwitch
                     targets,
                     actions: settings.host_switch_actions.clone(),
                 }
+            })
+        })
+        .collect()
+}
+
+/// Keyboards with an `arrive` action that went from offline or absent in
+/// `prev` to online in `next`.
+fn host_arrivals(config: &Config, prev: &[AgentDevice], next: &[AgentDevice]) -> Vec<HostArrival> {
+    next.iter()
+        .filter(|device| device.online)
+        .filter_map(|device| {
+            let action = config
+                .devices
+                .get(&device.config_key)?
+                .host_switch_actions
+                .arrive
+                .clone()?;
+            let was_online = prev
+                .iter()
+                .any(|before| before.config_key == device.config_key && before.online);
+            (!was_online).then(|| HostArrival {
+                keyboard_key: device.config_key.clone(),
+                action,
             })
         })
         .collect()

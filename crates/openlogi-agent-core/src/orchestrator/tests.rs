@@ -2,8 +2,8 @@
 
 use super::{
     AgentDevice, InventoryHealth, Orchestrator, VOLATILE_REAPPLY_CONFIRM_RETRIES,
-    any_device_needs_capture_rearm, build_devices, configured_wheel_mode, host_switch_links,
-    pick_current, plan_reapply, reapply_targets, stable_id,
+    any_device_needs_capture_rearm, build_devices, configured_wheel_mode, host_arrivals,
+    host_switch_links, pick_current, plan_reapply, reapply_targets, stable_id,
 };
 use openlogi_core::app::ForegroundApp;
 use openlogi_core::binding::{Action, Binding, ButtonId};
@@ -446,6 +446,72 @@ fn host_switch_links_skip_keyboards_with_neither_targets_nor_actions() {
     let devices = [dev("keyboard", 1, true)];
 
     assert!(host_switch_links(&config, &devices).is_empty());
+}
+
+fn arrive_config(key: &str) -> Config {
+    let mut config = Config::default();
+    config
+        .devices
+        .entry(key.into())
+        .or_default()
+        .host_switch_actions
+        .arrive = Some(Action::RunShellCommand("deskswitch arrive".into()));
+    config
+}
+
+#[test]
+fn host_arrivals_fire_on_offline_to_online_and_absent_to_online_edges() {
+    let config = arrive_config("keyboard");
+    let woke = host_arrivals(
+        &config,
+        &[dev("keyboard", 1, false)],
+        &[dev("keyboard", 1, true)],
+    );
+    assert_eq!(woke.len(), 1);
+    assert_eq!(woke[0].keyboard_key, "keyboard");
+    assert_eq!(
+        woke[0].action,
+        Action::RunShellCommand("deskswitch arrive".into())
+    );
+
+    let appeared = host_arrivals(&config, &[], &[dev("keyboard", 1, true)]);
+    assert_eq!(
+        appeared.len(),
+        1,
+        "a BLE keyboard is absent, not offline, while away"
+    );
+}
+
+#[test]
+fn host_arrivals_ignore_steady_state_offline_and_unconfigured_devices() {
+    let config = arrive_config("keyboard");
+    assert!(
+        host_arrivals(
+            &config,
+            &[dev("keyboard", 1, true)],
+            &[dev("keyboard", 1, true)]
+        )
+        .is_empty()
+    );
+    assert!(
+        host_arrivals(
+            &config,
+            &[dev("keyboard", 1, true)],
+            &[dev("keyboard", 1, false)]
+        )
+        .is_empty()
+    );
+    assert!(host_arrivals(&config, &[], &[dev("mouse", 2, true)]).is_empty());
+}
+
+#[test]
+fn refresh_inventory_never_reports_arrivals_before_the_first_reconcile() {
+    let mut orch = orchestrator(arrive_config("keyboard"));
+    let first = orch.refresh_inventory(&[], &[], false);
+    assert!(
+        first.is_empty(),
+        "the very first reconcile is a baseline, not an edge"
+    );
 }
 
 #[test]
