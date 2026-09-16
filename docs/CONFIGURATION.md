@@ -78,12 +78,36 @@ Common device fields are:
   in `bindings`
 - `action_ring`: default and complete per-application eight-slot layouts
 - `lighting`, `smartshift`, standalone `light`, and camera controls / profiles
-- `host_switch_targets` and `fn_lock` for compatible keyboards
+- `host_switch_targets`, `host_switch_actions`, and `fn_lock` for compatible
+  keyboards
 - `identity` and `disabled_gestures`, which are application-managed metadata
 
 `[keyboard.bindings]` contains global key triggers such as `f1` or
 `shift+command+f5`. Supported trigger modifiers are `shift`, `control`,
 `option`, and `command`; aliases such as `ctrl`, `alt`, and `cmd` are accepted.
+
+## Host switch actions
+
+A keyboard entry may fire actions around Easy-Switch host changes:
+
+```toml
+[devices."<keyboard key>".host_switch_actions]
+slot_1 = { RunShellCommand = "/usr/local/bin/deskswitch switch --slot 1" }
+slot_2 = { RunShellCommand = "/usr/local/bin/deskswitch switch --slot 2" }
+slot_3 = { RunShellCommand = "/usr/local/bin/deskswitch switch --slot 3" }
+arrive = { RunShellCommand = "/usr/local/bin/deskswitch arrive" }
+```
+
+`slot_N` fires the instant a switch to slot `N` is observed — from the
+keyboard's host key or from `openlogi host switch N` — concurrently with the
+device moves, never delaying them, and only when the keyboard actually changes
+host. `arrive` fires when the keyboard connects to this machine after the agent
+has completed its first inventory pass; it never fires at agent startup.
+
+Script actions receive `OPENLOGI_HOST_SLOT` (1–3; absent for `arrive`),
+`OPENLOGI_DEVICE_KEY` (the keyboard's config key), and `OPENLOGI_TRIGGER`
+(`key`, `command`, or `arrive`). The agent runs hooks with a minimal `PATH`, so
+use absolute binary paths.
 
 ## Actions
 
