@@ -135,6 +135,20 @@ pub struct HostInfo {
     pub name_max_len: u8,
 }
 
+/// One chunk of a host slot's friendly name, as returned by
+/// `getHostFriendlyName` (function 3): up to 14 bytes starting at `byte_index`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[non_exhaustive]
+pub struct HostFriendlyNameChunk {
+    /// Host slot index returned by the device.
+    pub host_index: HostIndex,
+    /// Offset of `bytes[0]` within the full name.
+    pub byte_index: u8,
+    /// Raw UTF-8 bytes; only the first `name_len - byte_index` are meaningful.
+    pub bytes: [u8; 14],
+}
+
 /// Raw host descriptor page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -208,6 +222,27 @@ impl HostsInfoFeature {
                 .map_err(|_| Hidpp20Error::UnsupportedResponse)?,
             page_index: payload[1] & 0x0f,
             body,
+        })
+    }
+
+    /// Retrieves the friendly-name bytes of `host` starting at `byte_index`.
+    /// Callers loop until they have [`HostInfo::name_len`] bytes.
+    pub async fn get_host_friendly_name(
+        &self,
+        host: HostIndex,
+        byte_index: u8,
+    ) -> Result<HostFriendlyNameChunk, Hidpp20Error> {
+        let payload = self
+            .endpoint
+            .call(3, [u8::from(host), byte_index, 0])
+            .await?
+            .extend_payload();
+        let mut bytes = [0; 14];
+        bytes.copy_from_slice(&payload[2..16]);
+        Ok(HostFriendlyNameChunk {
+            host_index: HostIndex::from(payload[0]),
+            byte_index: payload[1],
+            bytes,
         })
     }
 }
