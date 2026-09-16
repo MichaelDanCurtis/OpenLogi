@@ -6,7 +6,7 @@
 //! from this process would race it.
 
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::{Args, Subcommand};
@@ -14,7 +14,10 @@ use openlogi_core::device::DeviceKind;
 use openlogi_core::hid::{
     DeviceRoute, HostSlotInfo, HostSlots, HostSwitchCommandError, HostSwitchOutcome,
 };
-use openlogi_ipc::{AgentClient, AgentSnapshot, ClientKind, PROTOCOL_VERSION, client};
+use openlogi_ipc::{
+    AgentClient, AgentSnapshot, ClientKind, HOST_SLOTS_BUDGET, HOST_SWITCH_BUDGET,
+    PROTOCOL_VERSION, client,
+};
 use serde::Serialize;
 use tarpc::context;
 
@@ -136,9 +139,13 @@ async fn list(args: HostListArgs) -> Result<ExitCode> {
     let mut keyboards = Vec::new();
     for keyboard in keyboards_in(&snapshot, args.device.as_deref()) {
         let (slots, error) = if keyboard.online {
+            let mut ctx = context::current();
+            // Above the agent's own host-slots budget, or tarpc would cancel
+            // the handler mid-read instead of waiting it out.
+            ctx.deadline = Instant::now() + HOST_SLOTS_BUDGET + Duration::from_secs(5);
             match tokio::time::timeout(
-                Duration::from_secs(10),
-                agent.host_slots(context::current(), keyboard.route.clone()),
+                HOST_SLOTS_BUDGET + Duration::from_secs(10),
+                agent.host_slots(ctx, keyboard.route.clone()),
             )
             .await
             {
@@ -208,6 +215,8 @@ fn list_exit_code(keyboards: &[KeyboardReport]) -> u8 {
     }
 }
 
+/// Move the matched keyboard to `args.slot`, printing the outcome and
+/// mapping it to a process exit code (see [`exit_code_for`]).
 async fn switch(args: HostSwitchArgs) -> Result<ExitCode> {
     let Some((agent, snapshot)) = connect().await else {
         return Ok(ExitCode::from(AGENT_UNAVAILABLE));
@@ -230,12 +239,22 @@ async fn switch(args: HostSwitchArgs) -> Result<ExitCode> {
             ));
         }
     };
+    let mut ctx = context::current();
+    // Above the agent's own host-switch budget, or tarpc would cancel the
+    // handler mid-switch instead of waiting it out.
+    ctx.deadline = Instant::now() + HOST_SWITCH_BUDGET + Duration::from_secs(5);
+    let switch_timeout = HOST_SWITCH_BUDGET + Duration::from_secs(10);
     let result = tokio::time::timeout(
-        Duration::from_secs(15),
-        agent.switch_host(context::current(), keyboard.route.clone(), args.slot),
+        switch_timeout,
+        agent.switch_host(ctx, keyboard.route.clone(), args.slot),
     )
     .await
-    .context("the agent did not answer the host switch within 15 seconds")?
+    .with_context(|| {
+        format!(
+            "the agent did not answer the host switch within {}s",
+            switch_timeout.as_secs()
+        )
+    })?
     .context("host switch RPC failed")?;
     match &result {
         Ok(HostSwitchOutcome::Switched) => println!("{} → slot {}", keyboard.name, args.slot),

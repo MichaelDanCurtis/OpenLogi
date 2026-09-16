@@ -209,6 +209,20 @@ pub enum PairingPhase {
 /// passes, so a shorter deadline would kill the hold instead of waiting it out.
 pub const OBSERVE_HOLD: Duration = Duration::from_secs(20);
 
+/// How long the agent waits for a software-initiated host switch
+/// ([`Agent::switch_host`]) to complete before answering with a failure.
+/// Exported so a client can set its request deadline above it — tarpc
+/// cancels a handler whose deadline passes, so a shorter deadline would kill
+/// the wait instead of waiting it out.
+pub const HOST_SWITCH_BUDGET: Duration = Duration::from_secs(20);
+
+/// How long the agent waits for an Easy-Switch host-slot read
+/// ([`Agent::host_slots`]) to complete before answering with a failure.
+/// Exported so a client can set its request deadline above it — tarpc
+/// cancels a handler whose deadline passes, so a shorter deadline would kill
+/// the read instead of waiting it out.
+pub const HOST_SLOTS_BUDGET: Duration = Duration::from_secs(10);
+
 /// Monotonic stamp on the agent's observable state, bumped only when something
 /// in it actually changes.
 ///
@@ -563,12 +577,15 @@ pub trait Agent {
     /// it speaks only [`Agent::protocol_version`] — and so never arms.
     async fn declare_client(kind: ClientKind);
     /// Read the Easy-Switch host slots of the keyboard at `route`: current
-    /// slot, per-slot pairing status, and friendly names.
+    /// slot, per-slot pairing status, and friendly names. Answers within
+    /// [`HOST_SLOTS_BUDGET`]; the caller should set its request deadline
+    /// beyond it.
     async fn host_slots(route: DeviceRoute) -> Result<HostSlots, WriteError>;
     /// Move `keyboard` and its linked devices to 1-based `slot` (as printed on
     /// the key cap; the agent converts to the device's own indexing), firing
-    /// the keyboard's configured slot action. Completes after the switch is
-    /// applied or refused; the caller should budget about ten seconds.
+    /// the keyboard's configured slot action. Answers within
+    /// [`HOST_SWITCH_BUDGET`]; the caller should set its request deadline
+    /// beyond it.
     async fn switch_host(
         keyboard: DeviceRoute,
         slot: u8,

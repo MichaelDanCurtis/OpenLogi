@@ -27,8 +27,8 @@ use openlogi_hid::{
 use openlogi_ipc::transport;
 use openlogi_ipc::{
     ActionRingCommandError, ActionRingInvocation, Agent, AgentSnapshot, AgentStatus, ClientKind,
-    ConfigReloadError, Generation, Identity, MonitorEvent, Observation, PROTOCOL_VERSION,
-    PairingCommandError, PairingUpdate, RingObservation,
+    ConfigReloadError, Generation, HOST_SWITCH_BUDGET, Identity, MonitorEvent, Observation,
+    PROTOCOL_VERSION, PairingCommandError, PairingUpdate, RingObservation,
 };
 use succession::Compat;
 use tokio::sync::oneshot;
@@ -356,14 +356,15 @@ impl Agent for AgentServer {
                 reply,
             })
             .map_err(|_| HostSwitchCommandError::Busy)?;
-        match tokio::time::timeout(Duration::from_secs(20), outcome).await {
+        match tokio::time::timeout(HOST_SWITCH_BUDGET, outcome).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(HostSwitchCommandError::Io(
                 "the host switch watcher dropped the request".into(),
             )),
-            Err(_) => Err(HostSwitchCommandError::Io(
-                "the host switch did not complete within 20 seconds".into(),
-            )),
+            Err(_) => Err(HostSwitchCommandError::Io(format!(
+                "the host switch did not complete within {}s",
+                HOST_SWITCH_BUDGET.as_secs()
+            ))),
         }
     }
 }
