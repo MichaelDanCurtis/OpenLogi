@@ -191,4 +191,34 @@ mod tests {
             other => panic!("expected Diag(Wheel), got {other:?}"),
         }
     }
+
+    #[test]
+    fn host_switch_takes_a_one_based_slot_and_optional_device() {
+        let cli = Cli::try_parse_from(["openlogi", "host", "switch", "2", "--device", "MX KEYS"])
+            .expect("host switch parses");
+        match cli.cmd.expect("subcommand present") {
+            Command::Host(cmd::host::HostCmd::Switch(args)) => {
+                assert_eq!(args.slot, 2);
+                assert_eq!(args.device.as_deref(), Some("MX KEYS"));
+            }
+            other => panic!("expected Host(Switch), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_switch_rejects_slots_outside_one_to_three() {
+        Cli::try_parse_from(["openlogi", "host", "switch", "0"]).expect_err("slot 0 rejected");
+        Cli::try_parse_from(["openlogi", "host", "switch", "4"]).expect_err("slot 4 rejected");
+    }
+
+    #[test]
+    fn host_list_accepts_json() {
+        let cli = Cli::try_parse_from(["openlogi", "host", "list", "--json"]).expect("parses");
+        assert!(matches!(
+            cli.cmd,
+            Some(Command::Host(cmd::host::HostCmd::List(
+                cmd::host::HostListArgs { json: true, .. }
+            )))
+        ));
+    }
 }

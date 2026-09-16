@@ -7,6 +7,7 @@ pub mod assets;
 pub mod backlight;
 pub mod camera;
 pub mod diag;
+pub mod host;
 pub mod light;
 pub mod list;
 pub mod snapshot;
@@ -30,6 +31,9 @@ pub enum Command {
     /// Inspect and control standalone Logitech lights.
     #[command(subcommand)]
     Light(light::LightCmd),
+    /// Inspect and switch a keyboard's Easy-Switch host slots.
+    #[command(subcommand)]
+    Host(host::HostCmd),
 }
 
 impl Command {
@@ -49,6 +53,7 @@ impl Command {
             Self::Assets(cmd) => cmd.run()?,
             Self::Diag(cmd) => cmd.run().await?,
             Self::Light(cmd) => cmd.run().await?,
+            Self::Host(cmd) => return cmd.run().await,
         }
         Ok(ExitCode::SUCCESS)
     }
