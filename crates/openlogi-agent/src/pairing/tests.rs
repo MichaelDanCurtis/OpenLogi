@@ -31,6 +31,7 @@ fn shared_runtime() -> SharedRuntime {
         capture_rearm_generation: Arc::new(0.into()),
         receiver_access: ReceiverAccess::default(),
         host_switch_links,
+        host_switch_commands: tokio::sync::mpsc::unbounded_channel().0,
     }
 }
 
