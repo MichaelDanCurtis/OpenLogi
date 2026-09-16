@@ -9,7 +9,7 @@
 use crate::binding::{Action, ButtonId};
 use crate::config::{Config, DeviceConfig};
 #[cfg(test)]
-use crate::config::{LightSettings, Lighting, LinkConfig};
+use crate::config::{HostSwitchActions, LightSettings, Lighting, LinkConfig};
 use crate::device::Capabilities;
 use crate::device_order::{DeviceIdentity, DeviceStableId, PhysicalDeviceKey};
 #[cfg(test)]
@@ -343,6 +343,7 @@ pub(super) fn fold(device: &mut DeviceConfig, mut legacy: DeviceConfig, route_ke
     }
     fold_if_empty!(dpi_presets);
     fold_if_empty!(host_switch_targets);
+    fold_if_empty!(host_switch_actions);
 
     // `ActionRingConfig` has its own notion of "unset". Two configured rings
     // cannot be merged — the slots are positional — so the canonical one wins
@@ -973,6 +974,76 @@ mod tests {
         assert!(
             !config.devices["unit:6be9d300"].enabled,
             "the legacy opt-out survives adoption"
+        );
+    }
+
+    #[test]
+    fn folding_takes_host_switch_actions_the_canonical_entry_lacks() {
+        // A route-keyed entry carrying `host_switch_actions` must not lose
+        // the whole table the moment the keyboard is sighted with a unit id;
+        // it is folded exactly like `host_switch_targets`.
+        let mut config = Config::default();
+        let legacy = DeviceConfig {
+            host_switch_actions: HostSwitchActions {
+                slot_2: Some(Action::RunShellCommand("switch".to_string())),
+                ..HostSwitchActions::default()
+            },
+            ..DeviceConfig::default()
+        };
+        config
+            .devices
+            .insert("receiver:82839805:slot:1".to_string(), legacy);
+        config
+            .devices
+            .insert("unit:6be9d300".to_string(), DeviceConfig::default());
+
+        let canonical = PhysicalDeviceKey::parse("unit:6be9d300").expect("valid");
+        assert!(config.adopt_route(&canonical, "receiver:82839805:slot:1", None));
+
+        assert_eq!(
+            config.devices["unit:6be9d300"].host_switch_actions.slot_2,
+            Some(Action::RunShellCommand("switch".to_string())),
+            "the action table survives the fold"
+        );
+    }
+
+    #[test]
+    fn folding_keeps_the_canonical_host_switch_actions_when_both_are_configured() {
+        // Two configured tables cannot be merged — like `host_switch_targets`,
+        // the canonical entry wins a genuine conflict and the legacy one is
+        // logged and dropped, not silently merged field by field.
+        let mut config = Config::default();
+        let legacy = DeviceConfig {
+            host_switch_actions: HostSwitchActions {
+                slot_1: Some(Action::RunShellCommand("legacy".to_string())),
+                ..HostSwitchActions::default()
+            },
+            ..DeviceConfig::default()
+        };
+        let canonical_entry = DeviceConfig {
+            host_switch_actions: HostSwitchActions {
+                slot_2: Some(Action::RunShellCommand("canonical".to_string())),
+                ..HostSwitchActions::default()
+            },
+            ..DeviceConfig::default()
+        };
+        config
+            .devices
+            .insert("receiver:82839805:slot:1".to_string(), legacy);
+        config
+            .devices
+            .insert("unit:6be9d300".to_string(), canonical_entry);
+
+        let canonical = PhysicalDeviceKey::parse("unit:6be9d300").expect("valid");
+        config.adopt_route(&canonical, "receiver:82839805:slot:1", None);
+
+        assert_eq!(
+            config.devices["unit:6be9d300"].host_switch_actions,
+            HostSwitchActions {
+                slot_2: Some(Action::RunShellCommand("canonical".to_string())),
+                ..HostSwitchActions::default()
+            },
+            "the canonical table wins a genuine conflict"
         );
     }
 }
