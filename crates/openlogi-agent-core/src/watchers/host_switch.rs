@@ -146,7 +146,7 @@ impl HostSwitchManagerState {
         } else {
             published.as_slice()
         };
-        stop_unwanted(&mut self.sessions, wanted).await;
+        stop_unwanted(&mut self.sessions, wanted, &mut self.pending).await;
         self.restart_after
             .retain(|(link, _)| published.contains(link));
         for link in wanted {
@@ -193,6 +193,10 @@ impl HostSwitchManagerState {
         device_io: &DeviceIoGate,
         dispatcher: &ActionDispatcher,
     ) {
+        if command.reply.is_closed() {
+            debug!(route = %command.keyboard, "host switch command reply already closed; skipping");
+            return;
+        }
         if !device_io.allows_io() || self.pending.is_some() || requests.any() {
             let _ = command.reply.send(Err(HostSwitchCommandError::Busy));
             return;
@@ -222,7 +226,12 @@ impl HostSwitchManagerState {
         // below waits for the exclusive lease, and only this loop can stop a
         // session, so those sessions must be released first or the watcher
         // deadlocks on itself.
-        stop_all(&mut self.sessions, HostSwitchStopReason::Graceful).await;
+        stop_all(
+            &mut self.sessions,
+            HostSwitchStopReason::Graceful,
+            &mut self.pending,
+        )
+        .await;
         let link = links
             .borrow()
             .iter()
@@ -407,12 +416,17 @@ async fn handle_completion(
         };
     };
     let completed = state.sessions.remove(index);
-    let _ = completed.task.await;
+    await_session_task(completed.task, completed.generation, &mut state.pending).await;
     if let Some((link, host)) = completion.request {
         if !device_io.wait_until_allowed().await {
             return CompletionOutcome::Shutdown;
         }
-        stop_all(&mut state.sessions, HostSwitchStopReason::Graceful).await;
+        stop_all(
+            &mut state.sessions,
+            HostSwitchStopReason::Graceful,
+            &mut state.pending,
+        )
+        .await;
         // A parked command answers only from its own generation: matching by
         // keyboard alone would risk handing its reply to a different,
         // later-armed session for the same keyboard instead.
@@ -484,7 +498,16 @@ async fn answer_orphaned_pending(
             if !device_io.wait_until_allowed().await {
                 return CompletionOutcome::Shutdown;
             }
-            stop_all(sessions, HostSwitchStopReason::Graceful).await;
+            // `pending` above is already this function's own `pending`
+            // argument (owned, not `state.pending`), so there is nothing
+            // else parked to strand here.
+            let mut nothing_pending = None;
+            stop_all(
+                sessions,
+                HostSwitchStopReason::Graceful,
+                &mut nothing_pending,
+            )
+            .await;
             run_transition(
                 links,
                 channel_pool,
@@ -562,32 +585,73 @@ struct SessionCompletion {
     request: Option<(HostSwitchLink, u8)>,
 }
 
-async fn stop_all(sessions: &mut Vec<RunningSession>, reason: HostSwitchStopReason) {
-    let running = std::mem::take(sessions);
-    let mut tasks = Vec::with_capacity(running.len());
-    for RunningSession { stop, task, .. } in running {
-        if let Some(stop) = stop {
-            let _ = stop.send(reason);
+/// Await a stopped session's task. A [`JoinError`](tokio::task::JoinError)
+/// means the task panicked instead of sending its own completion, so a
+/// `pending` command parked against `generation` would otherwise wait
+/// forever behind [`HostSwitchManagerState::handle_command`]'s
+/// `self.pending.is_some()` gate — every later command answered `Busy` until
+/// restart. Answer it here instead, from the one place that knows the task
+/// will never complete normally.
+async fn await_session_task(
+    task: tokio::task::JoinHandle<()>,
+    generation: u64,
+    pending: &mut Option<PendingCommand>,
+) {
+    if let Err(join_error) = task.await {
+        warn!(%join_error, generation, "host switch session task panicked");
+        if let Some(pending) = pending.take_if(|pending| pending.generation == generation) {
+            let _ = pending.reply.send(Err(HostSwitchCommandError::Io(
+                "host switch session task panicked".into(),
+            )));
         }
-        tasks.push(task);
-    }
-    for task in tasks {
-        let _ = task.await;
     }
 }
 
-async fn stop_unwanted(sessions: &mut Vec<RunningSession>, wanted: &[HostSwitchLink]) {
+async fn stop_all(
+    sessions: &mut Vec<RunningSession>,
+    reason: HostSwitchStopReason,
+    pending: &mut Option<PendingCommand>,
+) {
+    let running = std::mem::take(sessions);
+    let mut tasks = Vec::with_capacity(running.len());
+    for RunningSession {
+        stop,
+        task,
+        generation,
+        ..
+    } in running
+    {
+        if let Some(stop) = stop {
+            let _ = stop.send(reason);
+        }
+        tasks.push((generation, task));
+    }
+    for (generation, task) in tasks {
+        await_session_task(task, generation, pending).await;
+    }
+}
+
+async fn stop_unwanted(
+    sessions: &mut Vec<RunningSession>,
+    wanted: &[HostSwitchLink],
+    pending: &mut Option<PendingCommand>,
+) {
     let mut index = 0;
     while index < sessions.len() {
         if wanted.contains(&sessions[index].link) {
             index += 1;
             continue;
         }
-        let RunningSession { stop, task, .. } = sessions.remove(index);
+        let RunningSession {
+            stop,
+            task,
+            generation,
+            ..
+        } = sessions.remove(index);
         if let Some(stop) = stop {
             let _ = stop.send(HostSwitchStopReason::Graceful);
         }
-        let _ = task.await;
+        await_session_task(task, generation, pending).await;
     }
 }
 
@@ -705,6 +769,15 @@ mod tests {
         DeviceRoute::Bolt {
             receiver_uid: "cafe".to_owned(),
             slot,
+        }
+    }
+
+    fn link_for_route(slot: u8) -> HostSwitchLink {
+        HostSwitchLink {
+            keyboard_key: String::new(),
+            keyboard: route(slot),
+            targets: Vec::new(),
+            actions: HostSwitchActions::default(),
         }
     }
 
@@ -1024,6 +1097,54 @@ mod tests {
             Err(HostSwitchCommandError::Io(
                 "host switch session ended before the switch was applied".into()
             ))
+        );
+        assert!(
+            state.pending.is_none(),
+            "the answered pending command must not leave a stale Busy gate behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_pending_with_a_request_runs_the_transition() {
+        use openlogi_core::hid::HostSwitchCommandError;
+        let receiver_access = ReceiverAccess::default();
+        let mut device_io = openlogi_hid::device_io_channel().1;
+        let (links_tx, mut links) = watch::channel(std::sync::Arc::new(Vec::new()));
+        let _keep = links_tx;
+        let (_, dispatcher) = test_dispatcher();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let generation: u64 = 11;
+        // As in `orphaned_pending_is_answered_when_its_completion_arrives_unmatched`,
+        // no session for `generation` exists in `state.sessions` — but this
+        // completion carries a `request`, the same shape a stopped armed
+        // session reports when it observed a key press or command before
+        // exiting.
+        let mut state = HostSwitchManagerState::new();
+        state.pending = Some(PendingCommand {
+            generation,
+            reply: reply_tx,
+        });
+
+        let outcome = handle_completion(
+            &mut state,
+            &mut links,
+            &openlogi_hid::host::channel_pool(),
+            &receiver_access,
+            &dispatcher,
+            &mut device_io,
+            SessionCompletion {
+                generation,
+                request: Some((link_for_route(9), 1)),
+            },
+        )
+        .await;
+
+        assert!(matches!(outcome, CompletionOutcome::Handled));
+        assert_eq!(
+            reply_rx.await.expect("a reply is always sent"),
+            Err(HostSwitchCommandError::KeyboardNotFound),
+            "the orphaned pending command must still run the transition, not just \
+             answer generically — an unreachable route fails fast with the real error"
         );
         assert!(
             state.pending.is_none(),
