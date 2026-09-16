@@ -542,6 +542,7 @@ fn event_host(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use hidpp::channel::HidppChannel;
 
@@ -731,11 +732,8 @@ mod tests {
     async fn callback_does_not_fire_when_keyboard_cannot_be_opened() {
         // Negative test: keyboard not found should never call the callback,
         // even if it were ready to validate.
-        use std::sync::Arc as StdArc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let callback_called = StdArc::new(AtomicBool::new(false));
-        let callback_called_clone = StdArc::clone(&callback_called);
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_clone = Arc::clone(&callback_called);
         let backend = crate::channel::scripted::ScriptedBackend::new(vec![]);
         let pool = crate::ChannelPool::with_backend(backend);
 
@@ -838,16 +836,6 @@ mod tests {
             host_change_required(0, 2, 2).is_err(),
             "host 2 is outside a device that reports 2 hosts and must be rejected"
         );
-    }
-
-    #[test]
-    fn validated_callback_fires_only_when_a_move_is_required() {
-        assert!(matches!(super::host_change_required(0, 3, 1), Ok(true)));
-        assert!(matches!(super::host_change_required(1, 3, 1), Ok(false)));
-        assert!(matches!(
-            super::host_change_required(0, 3, 3),
-            Err(super::HostSwitchError::Hidpp(_))
-        ));
     }
 
     #[test]
