@@ -12,24 +12,10 @@ use openlogi_core::hid::{HostSlotInfo, HostSlots};
 use tracing::debug;
 
 use crate::SharedChannel;
-use crate::backend::HidBackend;
-use crate::channel::route::DeviceRoute;
 
-use super::{HidppOperation, WriteError, classify_hidpp_error, open_feature, with_route};
+use super::{HidppOperation, WriteError, classify_hidpp_error, open_feature};
 
 const FEATURE: u16 = 0x1815;
-
-/// Read the keyboard's host slots at `route`.
-pub async fn read_host_slots(
-    backend: &dyn HidBackend,
-    route: &DeviceRoute,
-) -> Result<HostSlots, WriteError> {
-    let index = route.device_index();
-    with_route(backend, route, move |channel| async move {
-        read_host_slots_on_channel(&channel, index).await
-    })
-    .await
-}
 
 /// Read host slots on an already-open [`SharedChannel`].
 pub async fn read_host_slots_on(shared: &SharedChannel) -> Result<HostSlots, WriteError> {

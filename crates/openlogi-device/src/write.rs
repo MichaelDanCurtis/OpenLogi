@@ -44,7 +44,7 @@ pub use hires_wheel::{
     get_scroll_wheel_mode_on, set_scroll_inversion, set_scroll_inversion_on, set_scroll_resolution,
     set_scroll_resolution_on, set_scroll_wheel_mode, set_scroll_wheel_mode_on,
 };
-pub use hosts::{read_host_slots, read_host_slots_on};
+pub use hosts::read_host_slots_on;
 pub use lighting::{
     LightingMethod, set_keyboard_color, set_keyboard_color_on, set_keyboard_color_with,
     set_keyboard_color_with_on,
