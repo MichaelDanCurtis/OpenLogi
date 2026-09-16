@@ -133,6 +133,10 @@ pub enum HidppOperation {
     Light,
     /// Play one haptic waveform. Appended last — variant order is wire format.
     PlayHaptic,
+    /// Read HostsInfo slots and names.
+    ReadHostSlots,
+    /// Software-initiated ChangeHost.
+    SwitchHost,
 }
 
 /// HID++ feature error kind in a serializable wire-safe form.
