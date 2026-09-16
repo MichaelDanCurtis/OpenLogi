@@ -100,15 +100,17 @@ arrive = { RunShellCommand = "/usr/local/bin/deskswitch arrive" }
 
 `slot_N` fires the instant a switch to slot `N` is observed — from the
 keyboard's host key (a software-initiated switch will use the same path) —
-concurrently with the device moves, never delaying them, and only when the
-keyboard actually changes host. `arrive` fires when the keyboard connects to
-this machine after the agent has completed its first inventory pass; it never
-fires at agent startup.
+and only when the keyboard actually changes host. Script actions run on a
+worker thread and never delay the device moves; other action kinds dispatch
+inline, so prefer `RunShellCommand` here. `arrive` fires when the keyboard
+connects to this machine after the agent's first completed inventory pass; a
+keyboard already present at launch never fires it.
 
 Script actions receive `OPENLOGI_HOST_SLOT` (1–3; absent for `arrive`),
 `OPENLOGI_DEVICE_KEY` (the keyboard's config key), and `OPENLOGI_TRIGGER`
 (`key` or `arrive`; `command` is reserved for a software-initiated switch).
-The agent runs hooks with a minimal `PATH`, so use absolute binary paths.
+Hooks inherit the agent's environment; under launchd/systemd that `PATH` is
+minimal, so prefer absolute binary paths.
 
 ## Actions
 

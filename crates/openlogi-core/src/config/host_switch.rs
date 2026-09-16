@@ -8,10 +8,11 @@ use crate::binding::Action;
 /// Actions fired around a keyboard's host switching.
 ///
 /// `slot_N` fires the instant a switch to Easy-Switch slot `N` is observed —
-/// from the keyboard's own host key or from a software-initiated switch — in
-/// parallel with the device moves and never delaying them. `arrive` fires when
-/// the keyboard transitions offline → online after the agent's first inventory
-/// reconcile, as a fallback for a machine that was left without an agent.
+/// from the keyboard's own host key or from a software-initiated switch.
+/// Script actions run on a worker thread and never delay the device moves;
+/// other action kinds dispatch inline. `arrive` fires when the keyboard
+/// transitions offline → online after the agent's first inventory reconcile,
+/// as a fallback for a machine that was left without an agent.
 ///
 /// Every field is optional and the whole table is omitted from `config.toml`
 /// while empty, so existing files serialize unchanged.
