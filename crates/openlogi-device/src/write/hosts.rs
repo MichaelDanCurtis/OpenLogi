@@ -49,12 +49,12 @@ async fn read_host_slots_on_channel(
         .await
         .map_err(|e| classify_hidpp_error(e, HidppOperation::ReadHostSlots, FEATURE))?;
     let current = match info.current_host {
-        HostIndex::Slot(index) => index.saturating_add(1),
+        HostIndex::Slot(index) => Some(index.saturating_add(1)),
         // `HostIndex::Current` should not appear here (the device reports a
         // concrete slot for `current_host`), and `HostIndex` is
         // `#[non_exhaustive]`, so every other case — including `Current` —
-        // falls back to the same "not reported" value.
-        _ => 0,
+        // falls back to "not reported".
+        _ => None,
     };
     let mut slots = Vec::with_capacity(usize::from(info.host_count));
     for host in 0..info.host_count {

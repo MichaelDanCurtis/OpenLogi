@@ -17,9 +17,9 @@ pub struct HostSlotInfo {
 /// The keyboard's host slots and which one it is talking to now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSlots {
-    /// 1-based slot number the device currently uses; 0 when the device did
-    /// not report a slot.
-    pub current: u8,
+    /// 1-based slot number the device currently uses, or `None` when the
+    /// device did not report one.
+    pub current: Option<u8>,
     /// Every slot the device has, in slot order.
     pub slots: Vec<HostSlotInfo>,
 }
@@ -62,7 +62,7 @@ mod tests {
     #[test]
     fn slots_serialize_with_one_based_numbers() -> Result<(), serde_json::Error> {
         let slots = HostSlots {
-            current: 1,
+            current: Some(1),
             slots: vec![HostSlotInfo {
                 slot: 1,
                 paired: Some(true),

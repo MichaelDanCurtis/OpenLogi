@@ -1056,7 +1056,7 @@ impl Agent for MockAgent {
         let state = self.state.lock().await;
         state.settings_for(&route)?;
         Ok(HostSlots {
-            current: 1,
+            current: Some(1),
             slots: vec![
                 HostSlotInfo {
                     slot: 1,

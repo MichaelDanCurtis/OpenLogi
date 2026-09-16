@@ -102,7 +102,7 @@ impl KeyboardReport {
         error: Option<String>,
     ) -> Self {
         let (current_slot, slots) = match slots {
-            Some(slots) => (Some(slots.current), Some(slots.slots)),
+            Some(slots) => (slots.current, Some(slots.slots)),
             None => (None, None),
         };
         Self {
@@ -360,7 +360,7 @@ mod tests {
             "direct 046d:b37c".into(),
             true,
             Some(HostSlots {
-                current: 1,
+                current: Some(1),
                 slots: vec![HostSlotInfo {
                     slot: 1,
                     paired: Some(true),

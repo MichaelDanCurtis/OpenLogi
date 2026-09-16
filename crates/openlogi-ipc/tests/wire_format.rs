@@ -626,21 +626,43 @@ fn standalone_light_dtos_commands_and_errors() {
 fn host_slot_types() {
     assert_wire(
         &HostSlots {
-            current: 1,
+            current: Some(1),
             slots: vec![HostSlotInfo {
                 slot: 1,
                 paired: Some(true),
                 name: Some("Mac".into()),
             }],
         },
-        "010101010101034d6163",
+        "01010101010101034d6163",
     );
     assert_wire(
         &Ok::<HostSwitchOutcome, HostSwitchCommandError>(HostSwitchOutcome::Switched),
         "0000",
     );
     assert_wire(
+        &Ok::<HostSwitchOutcome, HostSwitchCommandError>(HostSwitchOutcome::AlreadyCurrent),
+        "0001",
+    );
+    assert_wire(
+        &Err::<HostSwitchOutcome, HostSwitchCommandError>(HostSwitchCommandError::KeyboardNotFound),
+        "0100",
+    );
+    assert_wire(
+        &Err::<HostSwitchOutcome, HostSwitchCommandError>(HostSwitchCommandError::InvalidSlot),
+        "0101",
+    );
+    assert_wire(
+        &Err::<HostSwitchOutcome, HostSwitchCommandError>(HostSwitchCommandError::UnpairedSlot),
+        "0102",
+    );
+    assert_wire(
+        &Err::<HostSwitchOutcome, HostSwitchCommandError>(HostSwitchCommandError::Busy),
+        "0103",
+    );
+    assert_wire(
         &Err::<HostSwitchOutcome, HostSwitchCommandError>(HostSwitchCommandError::Io("x".into())),
         "01040178",
     );
+    assert_wire(&HidppOperation::ReadHostSlots, "0f");
+    assert_wire(&HidppOperation::SwitchHost, "10");
 }
