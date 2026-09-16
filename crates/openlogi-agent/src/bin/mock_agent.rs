@@ -1055,6 +1055,7 @@ impl Agent for MockAgent {
     async fn host_slots(self, _: Context, route: DeviceRoute) -> Result<HostSlots, WriteError> {
         let state = self.state.lock().await;
         state.settings_for(&route)?;
+        info!(%route, "host_slots");
         Ok(HostSlots {
             current: Some(1),
             slots: vec![
@@ -1087,6 +1088,7 @@ impl Agent for MockAgent {
         state
             .settings_for(&keyboard)
             .map_err(|_| HostSwitchCommandError::KeyboardNotFound)?;
+        info!(%keyboard, slot, "switch_host");
         match slot {
             1 => Ok(HostSwitchOutcome::AlreadyCurrent),
             2 => Ok(HostSwitchOutcome::Switched),

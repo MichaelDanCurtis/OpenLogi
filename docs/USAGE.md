@@ -17,6 +17,7 @@ openlogi host switch 2        # move the keyboard (and linked mice) to slot 2
 ```
 
 `openlogi host` talks to the running agent (exit status 4 when none answers).
+`list` exits 3 when no keyboard matched, in both `--json` and table output.
 `switch` fires the keyboard's `host_switch_actions` for that slot exactly as a
 key press would, exits 0 when switched or already there, 2 when the slot is
 unpaired or invalid, and 3 when no online keyboard matched. With more than one

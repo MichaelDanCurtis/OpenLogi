@@ -94,6 +94,9 @@ fn assemble_name(name_len: u8, chunks: impl Iterator<Item = [u8; 14]>) -> Option
     let bytes: Vec<u8> = chunks.flatten().take(usize::from(name_len)).collect();
     String::from_utf8(bytes)
         .ok()
+        // A device may pad with NULs inside `name_len` rather than shrinking
+        // it, so trim them before deciding whether anything real was read.
+        .map(|name| name.trim_end_matches('\0').to_owned())
         .filter(|name| !name.is_empty())
 }
 
@@ -109,18 +112,20 @@ mod tests {
 
     #[test]
     fn names_span_chunks_and_stop_at_name_len() {
-        // The brief's original fixture split this name as "Michael's Mac" /
-        // "Book Pro-junk", but the right single quote (U+2019) is 3 bytes in
-        // UTF-8, not 1, so the first fragment was actually 15 bytes and
-        // overflowed the 14-byte chunk array. The split below lands the
-        // boundary one byte earlier ("Michael's Ma" / "cBook Pro-junk", still
-        // exactly "Michael's MacBook Pro-junk" once joined) so both chunks
-        // fit, and the expected 20-byte prefix is adjusted to match.
+        // U+2019 is 3 bytes, so the chunk boundary lands mid-name.
         let name = assemble_name(
             20,
             [chunk("Michael’s Ma"), chunk("cBook Pro-junk")].into_iter(),
         );
         assert_eq!(name.as_deref(), Some("Michael’s MacBook "));
+    }
+
+    #[test]
+    fn padded_names_lose_trailing_nuls() {
+        // `name_len` covers the whole chunk, but the device only wrote "Mac"
+        // into it and left the rest zeroed.
+        let name = assemble_name(14, [chunk("Mac")].into_iter());
+        assert_eq!(name.as_deref(), Some("Mac"));
     }
 
     #[test]
