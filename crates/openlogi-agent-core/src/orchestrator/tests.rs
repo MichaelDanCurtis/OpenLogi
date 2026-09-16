@@ -514,6 +514,47 @@ fn refresh_inventory_never_reports_arrivals_before_the_first_reconcile() {
     );
 }
 
+/// Drives an `arrive` edge end-to-end through `refresh_inventory`, the shape
+/// that would catch `had_baseline` being computed in the wrong place: a
+/// baseline reconcile, a steady-state repeat, an offline tick, then the
+/// keyboard reappearing.
+#[test]
+fn refresh_inventory_fires_arrive_exactly_once_across_an_offline_online_cycle() {
+    let key = "serial:keyboard-1";
+    let mut orch = orchestrator(arrive_config(key));
+    let online = direct_inventory_state(0xb350, Some("keyboard-1"), [9, 9, 9, 9], true);
+    let offline = direct_inventory_state(0xb350, Some("keyboard-1"), [9, 9, 9, 9], false);
+
+    // Call 1: the keyboard is already online on the very first reconcile —
+    // a baseline, not an edge.
+    assert!(
+        orch.refresh_inventory(std::slice::from_ref(&online), &[], false)
+            .is_empty()
+    );
+
+    // Call 2: identical snapshot — steady state, nothing fires.
+    assert!(
+        orch.refresh_inventory(std::slice::from_ref(&online), &[], false)
+            .is_empty()
+    );
+
+    // Call 3: the keyboard goes offline — still nothing.
+    assert!(
+        orch.refresh_inventory(std::slice::from_ref(&offline), &[], false)
+            .is_empty()
+    );
+
+    // Call 4: back online — exactly one arrival, for the right device and
+    // action.
+    let arrivals = orch.refresh_inventory(std::slice::from_ref(&online), &[], false);
+    assert_eq!(arrivals.len(), 1);
+    assert_eq!(arrivals[0].keyboard_key, key);
+    assert_eq!(
+        arrivals[0].action,
+        Action::RunShellCommand("deskswitch arrive".into())
+    );
+}
+
 #[test]
 fn reapply_targets_new_arrivals_and_transitions() {
     // First sighting of an online device → re-apply.
