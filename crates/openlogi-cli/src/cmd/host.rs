@@ -27,7 +27,9 @@ const REFUSED: u8 = 2;
 
 #[derive(Debug, Subcommand)]
 pub enum HostCmd {
-    /// Show every online keyboard's host slots.
+    /// Show every keyboard's Easy-Switch host slots (online and offline).
+    ///
+    /// Exits 3 when no keyboard matched, in both `--json` and table output.
     List(HostListArgs),
     /// Move the keyboard and its linked devices to a slot (1–3).
     Switch(HostSwitchArgs),
@@ -67,13 +69,23 @@ impl HostCmd {
 /// One keyboard in `host list --json`.
 #[derive(Debug, Serialize)]
 pub(crate) struct KeyboardReport {
+    /// Firmware codename, or the receiver's name when the device reported
+    /// none.
     pub name: String,
+    /// How this process would address the keyboard, rendered for display.
     pub route: String,
+    /// Whether the keyboard was reachable at snapshot time.
     pub online: bool,
+    /// The slot the keyboard is currently talking to. Omitted when the
+    /// keyboard is offline or its slots could not be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_slot: Option<u8>,
+    /// Every host slot the keyboard reported, in slot order. Omitted under
+    /// the same conditions as `current_slot`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slots: Option<Vec<HostSlotInfo>>,
+    /// Why `current_slot`/`slots` are missing — offline, a read failure, or a
+    /// timeout. Omitted when the read succeeded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -112,6 +124,11 @@ struct Keyboard {
     online: bool,
 }
 
+/// Print every matching keyboard's host slots — as JSON (`--json`) or a
+/// table. Exits [`KEYBOARD_NOT_FOUND`] when no keyboard matched, in *both*
+/// output modes: stdout still carries `{"keyboards":[]}` in JSON mode, so a
+/// script parsing it and a human reading "No keyboards found." see the same
+/// signal.
 async fn list(args: HostListArgs) -> Result<ExitCode> {
     let Some((agent, snapshot)) = connect().await else {
         return Ok(ExitCode::from(AGENT_UNAVAILABLE));
@@ -141,13 +158,14 @@ async fn list(args: HostListArgs) -> Result<ExitCode> {
             error,
         ));
     }
+    let exit_code = ExitCode::from(list_exit_code(&keyboards));
     if args.json {
         println!("{}", serde_json::to_string(&ListReport { keyboards })?);
-        return Ok(ExitCode::SUCCESS);
+        return Ok(exit_code);
     }
     if keyboards.is_empty() {
         println!("No keyboards found.");
-        return Ok(ExitCode::from(KEYBOARD_NOT_FOUND));
+        return Ok(exit_code);
     }
     for keyboard in &keyboards {
         println!("{} ({})", keyboard.name, keyboard.route);
@@ -175,7 +193,19 @@ async fn list(args: HostListArgs) -> Result<ExitCode> {
             (None, None) => {}
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(exit_code)
+}
+
+/// The process exit status for `host list`'s keyboard set:
+/// [`KEYBOARD_NOT_FOUND`] when nothing matched, 0 otherwise. The same rule
+/// applies whether the caller asked for JSON or the table, so the two modes
+/// never disagree on whether an empty result is a "success" or a refusal.
+fn list_exit_code(keyboards: &[KeyboardReport]) -> u8 {
+    if keyboards.is_empty() {
+        KEYBOARD_NOT_FOUND
+    } else {
+        0
+    }
 }
 
 async fn switch(args: HostSwitchArgs) -> Result<ExitCode> {
@@ -302,7 +332,7 @@ async fn connect() -> Option<(AgentClient, AgentSnapshot)> {
 mod tests {
     use openlogi_core::hid::{HostSlotInfo, HostSlots};
 
-    use super::{KeyboardReport, exit_code_for};
+    use super::{KeyboardReport, exit_code_for, list_exit_code};
 
     #[test]
     fn report_serializes_the_documented_shape() -> Result<(), serde_json::Error> {
@@ -325,6 +355,36 @@ mod tests {
         assert_eq!(json["slots"][0]["slot"], 1);
         assert_eq!(json["slots"][0]["paired"], true);
         Ok(())
+    }
+
+    #[test]
+    fn offline_report_carries_error_and_omits_slots() -> Result<(), serde_json::Error> {
+        let report = KeyboardReport::from_slots(
+            "MX KEYS S MAC".into(),
+            "direct 046d:b37c".into(),
+            false,
+            None,
+            Some("offline".into()),
+        );
+        let json = serde_json::to_value(&report)?;
+        assert_eq!(json["online"], false);
+        assert_eq!(json["error"], "offline");
+        assert!(json.get("current_slot").is_none());
+        assert!(json.get("slots").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn list_exit_code_flags_an_empty_result_only() {
+        assert_eq!(list_exit_code(&[]), 3);
+        let keyboard = KeyboardReport::from_slots(
+            "MX Keys".into(),
+            "direct 046d:b37c".into(),
+            true,
+            None,
+            None,
+        );
+        assert_eq!(list_exit_code(&[keyboard]), 0);
     }
 
     #[test]

@@ -39,8 +39,9 @@ pub enum Command {
 impl Command {
     /// Dispatch the parsed subcommand and report the process exit status.
     ///
-    /// Only `list` reports a status of its own (nothing connected); every
-    /// other subcommand either succeeds or fails outright.
+    /// `list` and `host` report a status of their own (nothing connected;
+    /// agent unreachable, no keyboard matched, or a switch was refused);
+    /// every other subcommand either succeeds or fails outright.
     pub async fn run(self) -> Result<ExitCode> {
         match self {
             Self::List(args) => return list::run(args).await,
