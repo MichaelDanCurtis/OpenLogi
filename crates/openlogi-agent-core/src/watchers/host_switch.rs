@@ -331,7 +331,7 @@ async fn run_transition(
         .acquire_exclusive(ExclusiveAccessReason::HostTransition)
         .await;
     let fire = || {
-        if !fire_slot_action(dispatcher, &link, host, trigger) {
+        if !fire_slot_action(dispatcher, &link, host, trigger) && !link.actions.is_empty() {
             debug!(host, route = %link.keyboard, "no host switch action configured for slot");
         }
     };
