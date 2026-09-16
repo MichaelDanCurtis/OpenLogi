@@ -179,16 +179,21 @@ impl HostSwitchManagerState {
     /// is stopped with `Requested`, so the switch runs through the very same
     /// completion path as a key press and replies from there; a keyboard with
     /// no armed session is switched directly and answered here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the watcher's other manager entry points, which thread the same handles"
+    )]
     async fn handle_command(
         &mut self,
         command: HostSwitchCommand,
+        requests: ReceiverRequestState,
         links: &mut watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>,
         channel_pool: &ChannelPool,
         receiver_access: &ReceiverAccess,
         device_io: &DeviceIoGate,
         dispatcher: &ActionDispatcher,
     ) {
-        if !device_io.allows_io() || self.pending.is_some() {
+        if !device_io.allows_io() || self.pending.is_some() || requests.any() {
             let _ = command.reply.send(Err(HostSwitchCommandError::Busy));
             return;
         }
@@ -302,9 +307,11 @@ async fn manage(
                 }
             }
             Some(command) = commands.recv() => {
+                let requests = *receiver_requests.borrow();
                 state
                     .handle_command(
                         command,
+                        requests,
                         &mut links,
                         &channel_pool,
                         &receiver_access,
@@ -840,6 +847,7 @@ mod tests {
                     host: 1,
                     reply: reply_tx,
                 },
+                ReceiverRequestState::default(),
                 &mut links,
                 &openlogi_hid::host::channel_pool(),
                 &ReceiverAccess::default(),
@@ -907,6 +915,7 @@ mod tests {
                     host: 1,
                     reply: reply_tx,
                 },
+                ReceiverRequestState::default(),
                 &mut links,
                 &openlogi_hid::host::channel_pool(),
                 &receiver_access,
@@ -928,6 +937,51 @@ mod tests {
         assert!(
             done_rx.recv().await.is_some(),
             "the stopped armed session should still have reported its own completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_while_exclusive_receiver_access_is_requested() {
+        use openlogi_core::hid::HostSwitchCommandError;
+        // Hold pairing's exclusive request open so `requests.any()` is true —
+        // the same signal `manage` reads off `receiver_requests` before
+        // calling `handle_command`.
+        let receiver_access = ReceiverAccess::default();
+        let _pairing_lease = receiver_access
+            .acquire_exclusive(ExclusiveAccessReason::Pairing)
+            .await;
+        let requests = *receiver_access.subscribe_requests().borrow();
+        assert!(requests.any());
+
+        let (links_tx, mut links) = watch::channel(std::sync::Arc::new(Vec::new()));
+        let _keep = links_tx;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut state = HostSwitchManagerState::new();
+        let (_, dispatcher) = test_dispatcher();
+
+        state
+            .handle_command(
+                HostSwitchCommand {
+                    keyboard: route(1),
+                    host: 1,
+                    reply: reply_tx,
+                },
+                requests,
+                &mut links,
+                &openlogi_hid::host::channel_pool(),
+                &receiver_access,
+                &openlogi_hid::device_io_channel().1,
+                &dispatcher,
+            )
+            .await;
+
+        assert_eq!(
+            reply_rx.await.expect("a reply is always sent"),
+            Err(HostSwitchCommandError::Busy)
+        );
+        assert!(
+            state.sessions.is_empty(),
+            "no session should be touched while exclusive access is requested"
         );
     }
 

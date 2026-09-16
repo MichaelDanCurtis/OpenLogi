@@ -46,8 +46,9 @@ pub enum HostSwitchCommandError {
     /// The device reports the slot as empty; switching would strand it.
     #[error("the requested host slot is not paired on the keyboard")]
     UnpairedSlot,
-    /// Pairing or another switch holds exclusive access, or the agent is
-    /// dormant.
+    /// Device I/O is suspended, pairing or another host transition holds
+    /// exclusive access, or another command is already pending. Retry
+    /// shortly.
     #[error("the agent is busy; retry shortly")]
     Busy,
     /// Transport or protocol failure, as text.
