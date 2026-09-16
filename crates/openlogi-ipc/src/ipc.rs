@@ -17,8 +17,8 @@ use openlogi_core::binding::{ActionRingIcon, ActionRingSlot};
 use openlogi_core::config::Lighting;
 use openlogi_core::device::{DeviceInventory, StandaloneDevice};
 use openlogi_core::hid::{
-    DeviceRoute, Dpi, DpiInfo, LightCommand, PairingError, PasskeyMethod, ReceiverSelector,
-    SmartShiftStatus, WriteError,
+    DeviceRoute, Dpi, DpiInfo, HostSlots, HostSwitchCommandError, HostSwitchOutcome, LightCommand,
+    PairingError, PasskeyMethod, ReceiverSelector, SmartShiftStatus, WriteError,
 };
 use serde::{Deserialize, Serialize};
 pub use succession::Identity;
@@ -61,7 +61,9 @@ pub use succession::Identity;
 /// v28: `Action::HoldShortcut` appended for lifecycle-held keyboard output.
 /// v29: `Agent::declare_client` + [`ClientKind`] appended — typed demand for
 ///      the macOS dormancy gate.
-pub const PROTOCOL_VERSION: u32 = 29;
+/// v30: `host_slots` + `switch_host` appended — Easy-Switch slot reads and
+///      software-initiated host switches for `openlogi host`.
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Environment variable through which the agent hands a supervised helper the
 /// run token it will serve, so the helper knows which agent it belongs to
@@ -560,4 +562,15 @@ pub trait Agent {
     /// arms only on [`ClientKind::Gui`]. The takeover probe never declares —
     /// it speaks only [`Agent::protocol_version`] — and so never arms.
     async fn declare_client(kind: ClientKind);
+    /// Read the Easy-Switch host slots of the keyboard at `route`: current
+    /// slot, per-slot pairing status, and friendly names.
+    async fn host_slots(route: DeviceRoute) -> Result<HostSlots, WriteError>;
+    /// Move `keyboard` and its linked devices to 1-based `slot` (as printed on
+    /// the key cap; the agent converts to the device's own indexing), firing
+    /// the keyboard's configured slot action. Completes after the switch is
+    /// applied or refused; the caller should budget about ten seconds.
+    async fn switch_host(
+        keyboard: DeviceRoute,
+        slot: u8,
+    ) -> Result<HostSwitchOutcome, HostSwitchCommandError>;
 }

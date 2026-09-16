@@ -40,8 +40,9 @@ use openlogi_core::device::{
 };
 use openlogi_core::hid::{
     Click, DeviceRoute, Dpi, DpiCapabilities, DpiInfo, HidppFeatureErrorKind, HidppOperation,
-    LightCommand, PasskeyMethod, ReceiverSelector, SmartShiftAutoDisengage, SmartShiftMode,
-    SmartShiftStatus, SmartShiftThreshold, TunableTorque, WriteError,
+    HostSlotInfo, HostSlots, HostSwitchCommandError, HostSwitchOutcome, LightCommand,
+    PasskeyMethod, ReceiverSelector, SmartShiftAutoDisengage, SmartShiftMode, SmartShiftStatus,
+    SmartShiftThreshold, TunableTorque, WriteError,
 };
 use openlogi_ipc::{
     ActionRingCommandError, ActionRingInvocation, ActionRingPresentation, AgentRequest,
@@ -101,7 +102,7 @@ fn representative_smartshift_status() -> SmartShiftStatus {
 /// that makes that visible in the same diff.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 29);
+    assert_eq!(PROTOCOL_VERSION, 30);
 }
 
 #[test]
@@ -118,6 +119,10 @@ fn config_reload_result() {
 /// wire format. `protocol_version` must stay variant 0 forever — it is the
 /// cross-version handshake (and the takeover probe) — and new methods append.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one golden assertion per Agent method, in append order; splitting would break the single ordered proof this test is"
+)]
 fn request_variant_order() {
     assert_wire(&AgentRequest::ProtocolVersion {}, "00");
     assert_wire(
@@ -205,6 +210,25 @@ fn request_variant_order() {
             kind: ClientKind::Overlay,
         },
         "1902",
+    );
+    assert_wire(
+        &AgentRequest::HostSlots {
+            route: DeviceRoute::Direct {
+                vendor_id: 0x046d,
+                product_id: 0xb37c,
+            },
+        },
+        "1a02fb6d04fb7cb3",
+    );
+    assert_wire(
+        &AgentRequest::SwitchHost {
+            keyboard: DeviceRoute::Direct {
+                vendor_id: 0x046d,
+                product_id: 0xb37c,
+            },
+            slot: 2,
+        },
+        "1b02fb6d04fb7cb302",
     );
 }
 
@@ -596,4 +620,27 @@ fn standalone_light_dtos_commands_and_errors() {
         "0c05636f6c6f72",
     );
     assert_wire(&WriteError::AmbiguousRawDevice, "0d");
+}
+
+#[test]
+fn host_slot_types() {
+    assert_wire(
+        &HostSlots {
+            current: 1,
+            slots: vec![HostSlotInfo {
+                slot: 1,
+                paired: Some(true),
+                name: Some("Mac".into()),
+            }],
+        },
+        "010101010101034d6163",
+    );
+    assert_wire(
+        &Ok::<HostSwitchOutcome, HostSwitchCommandError>(HostSwitchOutcome::Switched),
+        "0000",
+    );
+    assert_wire(
+        &Err::<HostSwitchOutcome, HostSwitchCommandError>(HostSwitchCommandError::Io("x".into())),
+        "01040178",
+    );
 }
