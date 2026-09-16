@@ -46,7 +46,9 @@ use openlogi_core::device::{
     DeviceModelInfo, DeviceTransports, LightCapabilities, LightValueRange, LightValueUnit,
     PairedDevice, RawDeviceAddress, ReceiverInfo, StandaloneDevice,
 };
-use openlogi_core::hid::LOGITECH_VENDOR_ID;
+use openlogi_core::hid::{
+    HostSlotInfo, HostSlots, HostSwitchCommandError, HostSwitchOutcome, LOGITECH_VENDOR_ID,
+};
 use openlogi_core::single_instance::{self, InstanceError};
 use openlogi_hid::{
     DIRECT_DEVICE_INDEX, DeviceRoute, Dpi, DpiCapabilities, DpiInfo, LITRA_GLOW_PRODUCT_ID,
@@ -1048,6 +1050,49 @@ impl Agent for MockAgent {
         }
         info!(%route, enabled, "set_light_manual_power");
         Ok(())
+    }
+
+    async fn host_slots(self, _: Context, route: DeviceRoute) -> Result<HostSlots, WriteError> {
+        let state = self.state.lock().await;
+        state.settings_for(&route)?;
+        Ok(HostSlots {
+            current: 1,
+            slots: vec![
+                HostSlotInfo {
+                    slot: 1,
+                    paired: Some(true),
+                    name: Some("Mock Mac".into()),
+                },
+                HostSlotInfo {
+                    slot: 2,
+                    paired: Some(true),
+                    name: Some("Mock PC".into()),
+                },
+                HostSlotInfo {
+                    slot: 3,
+                    paired: Some(false),
+                    name: None,
+                },
+            ],
+        })
+    }
+
+    async fn switch_host(
+        self,
+        _: Context,
+        keyboard: DeviceRoute,
+        slot: u8,
+    ) -> Result<HostSwitchOutcome, HostSwitchCommandError> {
+        let state = self.state.lock().await;
+        state
+            .settings_for(&keyboard)
+            .map_err(|_| HostSwitchCommandError::KeyboardNotFound)?;
+        match slot {
+            1 => Ok(HostSwitchOutcome::AlreadyCurrent),
+            2 => Ok(HostSwitchOutcome::Switched),
+            3 => Err(HostSwitchCommandError::UnpairedSlot),
+            _ => Err(HostSwitchCommandError::InvalidSlot),
+        }
     }
 }
 

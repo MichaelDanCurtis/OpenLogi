@@ -16,6 +16,7 @@ use openlogi_agent_core::observable::ObservableState;
 use openlogi_agent_core::orchestrator::{Orchestrator, SharedRuntime};
 use openlogi_agent_core::runtime::scroll::{ScrollInputHandle, ScrollRuntime};
 use openlogi_agent_core::runtime::{ActionDispatcher, ActionRuntime};
+use openlogi_agent_core::watchers::host_switch::HostSwitchCommand;
 use openlogi_agent_core::watchers::{self, gesture::GestureOutputs};
 use openlogi_core::config::Config;
 #[cfg(target_os = "macos")]
@@ -169,7 +170,11 @@ impl InputServices {
 }
 
 /// Start the HID++ background sessions that do not need Accessibility.
-pub(crate) fn spawn_hidpp_watchers(shared: &SharedRuntime, inputs: &InputServices) {
+pub(crate) fn spawn_hidpp_watchers(
+    shared: &SharedRuntime,
+    inputs: &InputServices,
+    host_switch_commands: Option<tokio::sync::mpsc::UnboundedReceiver<HostSwitchCommand>>,
+) {
     watchers::gesture::spawn(
         &shared.capture_plans,
         shared.capture_channel.clone(),
@@ -182,13 +187,18 @@ pub(crate) fn spawn_hidpp_watchers(shared: &SharedRuntime, inputs: &InputService
             shared.hook_maps.clone(),
         ),
     );
-    watchers::host_switch::spawn(
-        &shared.host_switch_links,
-        shared.channel_pool.clone(),
-        shared.receiver_access.clone(),
-        shared.device_io.clone(),
-        inputs.dispatcher.clone(),
-    );
+    if let Some(commands) = host_switch_commands {
+        watchers::host_switch::spawn(
+            &shared.host_switch_links,
+            shared.channel_pool.clone(),
+            shared.receiver_access.clone(),
+            shared.device_io.clone(),
+            inputs.dispatcher.clone(),
+            commands,
+        );
+    } else {
+        warn!("host switch watcher not started: command receiver already taken");
+    }
     watchers::keyboard::spawn(
         &shared.keyboard_spec,
         shared.keyboard_channel.clone(),
