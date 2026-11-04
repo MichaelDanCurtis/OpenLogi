@@ -1,5 +1,7 @@
 //! Unit tests for `Crown` mode parsing and event decoding.
 
+use std::assert_matches;
+
 use super::event::{
     ActivityState, ButtonState, CrownEvent, CrownGesture, RotationState, decode_event,
 };
@@ -27,10 +29,22 @@ fn rejects_unknown_mode_value() {
     let mut payload = [0; 16];
     payload[0] = 9;
 
-    assert!(matches!(
+    assert_matches!(
         CrownMode::from_payload(&payload),
         Err(crate::protocol::v20::Hidpp20Error::UnsupportedResponse)
-    ));
+    );
+}
+
+#[test]
+fn rejects_the_write_only_sentinel_in_a_response() {
+    // `0` is the request-side "leave unchanged" sentinel; a device answering
+    // it as the current mode is as unsupported as any unknown value.
+    let payload = [0; 16];
+
+    assert_matches!(
+        CrownMode::from_payload(&payload),
+        Err(crate::protocol::v20::Hidpp20Error::UnsupportedResponse)
+    );
 }
 
 #[test]
@@ -62,10 +76,32 @@ fn ignores_unknown_event_sub_id() {
 }
 
 #[test]
-fn ignores_event_with_unknown_enum() {
+fn keeps_event_with_unknown_enum_field() {
     let mut payload = [0; 16];
+    payload[1] = 0xfb; // -5 slots — a valid sibling field that must survive
     payload[6] = 0x09; // out-of-range button state
-    assert!(decode_event(0, &payload).is_none());
+    let CrownEvent::Update(update) = decode_event(0, &payload).expect("event kept");
+    assert_eq!(update.button, ButtonState::Other(0x09));
+    assert_eq!(update.relative_slot_rotation, -5);
+}
+
+/// Totality: for a known sub-id, no single field byte value may drop the whole
+/// event. Sweeps every value of each enum-typed field position.
+#[test]
+fn known_sub_id_survives_any_field_byte() {
+    for byte in 0..=u8::MAX {
+        for pos in [0usize, 3, 4, 5, 6] {
+            let mut payload = [0; 16];
+            payload[1] = 0xfb; // sibling that must always survive
+            payload[pos] = byte;
+            let CrownEvent::Update(update) = decode_event(0, &payload)
+                .unwrap_or_else(|| panic!("dropped event for payload[{pos}]={byte:#04x}"));
+            assert_eq!(
+                update.relative_slot_rotation, -5,
+                "sibling lost for payload[{pos}]={byte:#04x}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -73,5 +109,5 @@ fn maps_mode_enum_wire_values() {
     assert_eq!(u8::from(ReportingMode::Diverted), 2);
     assert_eq!(ReportingMode::try_from(1u8).unwrap(), ReportingMode::Hid);
     assert_eq!(u8::from(RatchetMode::Free), 1);
-    assert!(RatchetMode::try_from(3u8).is_err());
+    RatchetMode::try_from(3u8).unwrap_err();
 }

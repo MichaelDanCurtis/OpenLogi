@@ -1,87 +1,102 @@
-//! Background HID++ control-capture watcher for the active device.
+//! Background HID++ control-capture watcher, one session per online device.
 //!
-//! Runs [`openlogi_hid::run_capture_session`] on a dedicated thread for whichever
-//! device the DPI / SmartShift path currently targets
-//! ([`DpiCycleState::target`]), restarts it when the carousel selection — or the
-//! thumb-wheel arming — changes, and dispatches each captured input:
+//! Runs [`openlogi_hid::run_capture_session`] concurrently for every device in
+//! the shared capture-plan list (not just the GUI's selection), restarts a
+//! session when its device's plan — route, diverted controls, thumb-wheel
+//! arming — changes, and dispatches each captured input against the binding
+//! maps of the device it arrived on:
 //!
 //! - a gesture swipe through the gesture binding map,
 //! - a DPI/ModeShift or thumb-wheel-tap press through the button binding map,
-//! - thumb-wheel rotation through the [`ButtonId::ThumbwheelScrollUp`] /
-//!   [`ButtonId::ThumbwheelScrollDown`] bindings — either re-synthesised as
-//!   continuous, sensitivity-scaled horizontal scroll or accumulated into a
-//!   custom action,
+//! - thumb-wheel rotation through the
+//!   [`ThumbwheelScrollUp`](openlogi_core::binding::ButtonId::ThumbwheelScrollUp) /
+//!   [`ThumbwheelScrollDown`](openlogi_core::binding::ButtonId::ThumbwheelScrollDown)
+//!   bindings — either re-synthesised as continuous, sensitivity-scaled scroll
+//!   or accumulated into a custom action,
 //!
-//! all via the common action path ([`crate::hook_runtime::dispatch_action`]).
+//! all via the common [`crate::runtime::ActionDispatcher`].
 //!
 //! Unlike the CGEventTap hook, this needs no macOS Accessibility permission —
 //! the events arrive over HID++, and the bound action is synthesised the same
 //! way regardless.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, RwLock};
-use std::thread;
-use std::time::{Duration, Instant};
+mod dispatch;
 
-use openlogi_core::binding::{Action, ButtonId, GestureDirection, default_binding};
-use openlogi_core::config::DEFAULT_THUMBWHEEL_SENSITIVITY;
-use openlogi_hid::{CaptureChannel, CapturedInput, DeviceRoute, run_capture_session};
-use tokio::sync::{mpsc, oneshot};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use openlogi_core::device_order::PhysicalDeviceKey;
+use openlogi_core::scroll::ScrollDelta;
+use openlogi_hid::{
+    CaptureChannel, CaptureSessionOutcome, CapturedInput, DeviceIoGate, PendingCaptureRestore,
+    run_capture_session_with_registry_spec,
+};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use crate::DpiCycleState;
-use crate::hook_runtime::{self, SharedHookMaps};
-use crate::receiver_access::ReceiverAccess;
+use self::dispatch::InputDispatcher;
+use super::capture_session::{CaptureSession, CompletionAction, ReconcileAction};
+use crate::capture_plan::{CaptureTarget, DeviceCapturePlan, DispatchPlan, SharedCapturePlans};
+use crate::receiver_access::{ReceiverAccess, ReceiverRequestState, SessionReceiverLease};
+use crate::runtime::hook::SharedHookMaps;
+use crate::runtime::scroll::ScrollInputHandle;
+use crate::runtime::{ActionDispatcher, HidppSessionId};
 
-/// Shared gesture-direction binding map, mirrored from `AppState` (keyed by
-/// direction). The watcher reads it to map a captured swipe to a bound action.
-pub type GestureBindings = Arc<RwLock<BTreeMap<GestureDirection, Action>>>;
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// Shared thumb-wheel sensitivity, mirrored from `AppState`. Read on every wheel
-/// event; written only by `AppState::set_thumbwheel_sensitivity`.
-pub type ThumbwheelSensitivity = Arc<AtomicI32>;
-
-/// How often to re-read the active device target + thumb-wheel arming so a
-/// carousel switch or a binding/sensitivity edit re-points / re-arms capture.
-/// It also paces the respawn of a session that ended on its own (see `manage`).
-const TARGET_POLL: Duration = Duration::from_secs(1);
-
-/// Idle gap after which a partly-accumulated *custom* wheel action is forgotten,
-/// so slow intermittent nudges don't eventually cross the threshold.
-const ACTION_DECAY: Duration = Duration::from_millis(300);
-
-/// Minimum gap between two fires of the same custom wheel action, so one
-/// deliberate flick triggers once instead of repeating across a fast spin.
-const ACTION_COOLDOWN: Duration = Duration::from_millis(200);
-
-/// Speed multiplier for the wheel's continuous horizontal scroll. The default
-/// sensitivity is 1×; the scale is linear around it.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "sensitivity is a small 1..=100 integer — exact in f32"
-)]
-fn scroll_multiplier(sensitivity: i32) -> f32 {
-    sensitivity as f32 / DEFAULT_THUMBWHEEL_SENSITIVITY as f32
+/// Output capabilities shared by every HID++ gesture capture session.
+#[derive(Clone)]
+pub struct GestureOutputs {
+    actions: ActionDispatcher,
+    scroll: ScrollInputHandle,
+    hook_maps: SharedHookMaps,
 }
 
-/// Rotation increments required to fire a custom (non-scroll) wheel action.
-/// Higher sensitivity → fewer increments; always at least one.
-fn action_threshold(sensitivity: i32) -> i32 {
-    (2 * DEFAULT_THUMBWHEEL_SENSITIVITY - sensitivity).max(1)
+impl GestureOutputs {
+    /// Build gesture outputs backed by the shared action and scroll runtimes.
+    #[must_use]
+    pub fn new(
+        actions: ActionDispatcher,
+        scroll: ScrollInputHandle,
+        hook_maps: SharedHookMaps,
+    ) -> Self {
+        Self {
+            actions,
+            scroll,
+            hook_maps,
+        }
+    }
+
+    fn cancel_session(&self, session: &HidppSessionId) {
+        self.actions.cancel_hidpp_session(session);
+        self.scroll.cancel_hidpp_session(session);
+    }
+
+    fn post_scroll(&self, session: &HidppSessionId, delta: ScrollDelta) {
+        if !self.scroll.try_hidpp_scroll(session, delta) {
+            // HID++ diversion consumed the physical input already, so direct
+            // synthesis is this source's fail-open path.
+            openlogi_inject::post_scroll(delta);
+        }
+    }
 }
 
 /// Spawn the capture-manager thread. It owns a current-thread tokio runtime that
 /// keeps one capture session pointed at the active device and dispatches each
 /// captured input.
 pub fn spawn(
-    hook_maps: SharedHookMaps,
-    gesture_bindings: GestureBindings,
-    dpi_cycle: Arc<RwLock<DpiCycleState>>,
+    capture_plans: &SharedCapturePlans,
     capture_channel: CaptureChannel,
-    thumbwheel_sensitivity: ThumbwheelSensitivity,
     receiver_access: ReceiverAccess,
+    channel_registry: openlogi_hid::ChannelRegistry,
+    device_io: DeviceIoGate,
+    outputs: GestureOutputs,
 ) {
+    let plans = capture_plans.clone();
+    let receiver_requests = receiver_access.subscribe_requests();
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -94,508 +109,559 @@ pub fn spawn(
             }
         };
         runtime.block_on(manage(
-            hook_maps,
-            gesture_bindings,
-            dpi_cycle,
+            plans,
             capture_channel,
-            thumbwheel_sensitivity,
             receiver_access,
+            receiver_requests,
+            channel_registry,
+            device_io,
+            outputs,
         ));
     });
 }
 
-/// Whether the thumb wheel must be diverted over HID++ (which suppresses native
-/// scroll) so we can re-synthesise its scroll or capture its tap.
-///
-/// We divert when the sensitivity leaves its default (so we can scale scroll
-/// ourselves) or when the click or either rotation direction is rebound away
-/// from its default; otherwise the OS scrolls the wheel natively.
-fn thumbwheel_armed(hook_maps: &SharedHookMaps, sensitivity: i32) -> bool {
-    if sensitivity != DEFAULT_THUMBWHEEL_SENSITIVITY {
-        return true;
-    }
-    hook_maps.read().ok().is_some_and(|maps| {
-        [
-            ButtonId::Thumbwheel,
-            ButtonId::ThumbwheelScrollUp,
-            ButtonId::ThumbwheelScrollDown,
-        ]
-        .iter()
-        .any(|&button| {
-            maps.bindings
-                .get(&button)
-                .is_some_and(|action| *action != default_binding(button))
-        })
+type RunningSession = CaptureSession<CaptureTarget, DispatchPlan>;
+
+struct CapturedEvent {
+    physical_key: PhysicalDeviceKey,
+    session: HidppSessionId,
+    input: CapturedInput,
+}
+
+struct SessionDone {
+    physical_key: PhysicalDeviceKey,
+    session: HidppSessionId,
+    pending_restore: Option<PendingCaptureRestore>,
+}
+
+enum SessionEvent {
+    Input(CapturedEvent),
+    Done(SessionDone),
+}
+
+struct PendingRestore {
+    token: PendingCaptureRestore,
+    retry_at: Instant,
+}
+
+struct GestureManagerState {
+    sessions: HashMap<PhysicalDeviceKey, RunningSession>,
+    pending_restores: HashMap<PhysicalDeviceKey, PendingRestore>,
+    restart_after: HashMap<PhysicalDeviceKey, Instant>,
+    input_dispatcher: InputDispatcher,
+    lease: std::sync::Weak<SessionReceiverLease>,
+}
+
+#[derive(Clone)]
+struct SessionChannels {
+    events: mpsc::UnboundedSender<SessionEvent>,
+    capture: CaptureChannel,
+    registry: openlogi_hid::ChannelRegistry,
+    device_io: DeviceIoGate,
+}
+
+/// Forward one capture session's inputs onto the manager's ordered event
+/// channel. The sender closes only after the device listener has been dropped.
+fn spawn_input_forwarder(
+    physical_key: PhysicalDeviceKey,
+    session: HidppSessionId,
+    mut inputs: mpsc::UnboundedReceiver<CapturedInput>,
+    events: mpsc::UnboundedSender<SessionEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(input) = inputs.recv().await {
+            let _ = events.send(SessionEvent::Input(CapturedEvent {
+                physical_key: physical_key.clone(),
+                session: session.clone(),
+                input,
+            }));
+        }
     })
 }
 
-/// Whether a finished capture session should make the manager re-arm.
-///
-/// `done_epoch` identifies the session that signalled completion; `live_epoch`
-/// is the session the manager currently believes is running; `has_target` is
-/// whether a device is currently targeted. A session ending only warrants a
-/// respawn when it is the *current* one (not a stale session already superseded
-/// by a deliberate restart, whose epoch no longer matches) and a target is still
-/// set (not a deliberate stop-to-idle, e.g. while pairing owns the receiver).
-fn should_rearm(done_epoch: u64, live_epoch: u64, has_target: bool) -> bool {
-    done_epoch == live_epoch && has_target
+/// Report completion only after every input accepted by the device listener
+/// has reached the manager's event channel.
+async fn report_done_after_inputs(
+    forward_task: tokio::task::JoinHandle<()>,
+    events: mpsc::UnboundedSender<SessionEvent>,
+    done: SessionDone,
+) {
+    if let Err(error) = forward_task.await {
+        debug!(%error, "capture input forwarder ended unexpectedly");
+    }
+    let _ = events.send(SessionEvent::Done(done));
 }
 
-/// Keep one capture session alive for the active device, restarting it when the
-/// device or the thumb-wheel arming changes, and dispatch incoming inputs. Runs
-/// for the lifetime of the process.
-async fn manage(
-    hook_maps: SharedHookMaps,
-    gesture_bindings: GestureBindings,
-    dpi_cycle: Arc<RwLock<DpiCycleState>>,
-    capture_channel: CaptureChannel,
-    thumbwheel_sensitivity: ThumbwheelSensitivity,
-    receiver_access: ReceiverAccess,
+/// Return the plan that owns an input from the currently tracked session. An
+/// active session follows compatible plan updates; a deliberately stopped
+/// session keeps its frozen plan and remains admissible until its task reports
+/// that native firmware reporting has been restored.
+fn dispatch_context_for<'a>(
+    input_session: &HidppSessionId,
+    live: Option<&'a RunningSession>,
+) -> Option<(&'a HidppSessionId, &'a DispatchPlan)> {
+    live.filter(|session| session.owns(input_session))
+        .map(|session| (session.id(), session.dispatch()))
+}
+
+/// Snapshot the sessions that should be armed. An exclusive request
+/// temporarily makes the wanted set empty so normal teardown restores every
+/// control.
+#[cfg(test)]
+fn wanted_sessions(
+    requests: ReceiverRequestState,
+    capture_plans: &watch::Receiver<Arc<Vec<DeviceCapturePlan>>>,
+) -> Arc<Vec<DeviceCapturePlan>> {
+    if requests.any() {
+        return Arc::new(Vec::new());
+    }
+    Arc::clone(&capture_plans.borrow())
+}
+
+fn reconcile_session(
+    session: &mut RunningSession,
+    wanted: Option<(&CaptureTarget, &DispatchPlan)>,
+    dispatcher: &mut InputDispatcher,
 ) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<CapturedInput>();
-    // (route, capture_thumbwheel, divert_gesture_button)
-    let mut current: Option<(DeviceRoute, bool, bool)> = None;
-    let mut stop: Option<oneshot::Sender<()>> = None;
-    let mut ticker = tokio::time::interval(TARGET_POLL);
-    let mut accumulators = WheelAccumulators::default();
+    if session.reconcile(wanted) == ReconcileAction::DispatchChanged {
+        dispatcher.cancel_session(session.id());
+        let config_key = session.dispatch().config_key.clone();
+        session.rekey(&config_key);
+    }
+}
+
+/// Reconcile one tracked slot directly against the latest publication. Input
+/// calls this before dispatch so an event cannot slip between publishing a hot
+/// action update and processing its notification.
+fn reconcile_published_session(
+    key: &PhysicalDeviceKey,
+    session: &mut RunningSession,
+    receiver_requests: &watch::Receiver<ReceiverRequestState>,
+    capture_plans: &watch::Receiver<Arc<Vec<DeviceCapturePlan>>>,
+    dispatcher: &mut InputDispatcher,
+) {
+    if receiver_requests.borrow().any() {
+        reconcile_session(session, None, dispatcher);
+    } else {
+        let plans = capture_plans.borrow();
+        let wanted = plans
+            .iter()
+            .find(|plan| plan.target.physical_key == *key)
+            .map(|plan| (&plan.target, &plan.dispatch));
+        reconcile_session(session, wanted, dispatcher);
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn wait_for_registry_change(
+    changes: &mut watch::Receiver<()>,
+    has_pending_restore: bool,
+) -> bool {
+    if !has_pending_restore {
+        return std::future::pending().await;
+    }
+    changes.changed().await.is_ok()
+}
+
+fn acquire_session_lease(
+    receiver_access: &ReceiverAccess,
+    lease: &mut std::sync::Weak<SessionReceiverLease>,
+) -> Option<Arc<SessionReceiverLease>> {
+    if let Some(existing) = lease.upgrade() {
+        return Some(existing);
+    }
+    let fresh = Arc::new(receiver_access.try_acquire_for_session()?);
+    *lease = Arc::downgrade(&fresh);
+    Some(fresh)
+}
+
+async fn retry_pending_restores(
+    pending_restores: &mut HashMap<PhysicalDeviceKey, PendingRestore>,
+    registry: &openlogi_hid::ChannelRegistry,
+    now: Instant,
+) {
+    let keys: Vec<_> = pending_restores
+        .iter()
+        .filter(|(_, pending)| pending.retry_at <= now)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in keys {
+        let Some(pending) = pending_restores.remove(&key) else {
+            continue;
+        };
+        if let CaptureSessionOutcome::RestorePending(token) = pending.token.retry(registry).await {
+            pending_restores.insert(
+                key,
+                PendingRestore {
+                    token,
+                    retry_at: Instant::now() + RETRY_DELAY,
+                },
+            );
+        }
+    }
+}
+
+fn next_deadline(
+    requests: ReceiverRequestState,
+    device_io_allowed: bool,
+    pending_restores: &HashMap<PhysicalDeviceKey, PendingRestore>,
+    restart_after: &HashMap<PhysicalDeviceKey, Instant>,
+) -> Option<Instant> {
+    if requests.any() || !device_io_allowed {
+        return None;
+    }
+    pending_restores
+        .values()
+        .map(|pending| pending.retry_at)
+        .chain(restart_after.values().copied())
+        .min()
+}
+
+fn restart_deadline(unexpected: bool, now: Instant) -> Option<Instant> {
+    unexpected.then_some(now + RETRY_DELAY)
+}
+
+impl GestureManagerState {
+    fn new(outputs: GestureOutputs) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            pending_restores: HashMap::new(),
+            restart_after: HashMap::new(),
+            input_dispatcher: InputDispatcher::new(outputs),
+            lease: std::sync::Weak::new(),
+        }
+    }
+
+    fn deadline(&self, requests: ReceiverRequestState, device_io_allowed: bool) -> Option<Instant> {
+        next_deadline(
+            requests,
+            device_io_allowed,
+            &self.pending_restores,
+            &self.restart_after,
+        )
+    }
+
+    fn expedite_pending_restores(&mut self) {
+        let now = Instant::now();
+        for pending in self.pending_restores.values_mut() {
+            pending.retry_at = now;
+        }
+    }
+
+    async fn reconcile(
+        &mut self,
+        requests: ReceiverRequestState,
+        device_io_allowed: bool,
+        published: &Arc<Vec<DeviceCapturePlan>>,
+        receiver_access: &ReceiverAccess,
+        channels: &SessionChannels,
+    ) {
+        // Keep existing passive listeners and their firmware ownership intact
+        // while the display/session is asleep. Retiring them here would issue
+        // restoration writes during DarkWake; retries and successors wait for
+        // the user-visible resume instead.
+        if !device_io_allowed {
+            return;
+        }
+        let now = Instant::now();
+        let wanted = if requests.any() {
+            &[][..]
+        } else {
+            published.as_slice()
+        };
+        for (key, session) in &mut self.sessions {
+            let wanted = wanted
+                .iter()
+                .find(|plan| plan.target.physical_key == *key)
+                .map(|plan| (&plan.target, &plan.dispatch));
+            reconcile_session(session, wanted, &mut self.input_dispatcher);
+        }
+        self.restart_after.retain(|key, _| {
+            published
+                .iter()
+                .any(|plan| plan.target.physical_key == *key)
+        });
+
+        // Firmware ownership outlives the desired plan. Keep the strong lease
+        // through successor spawning so restore→rearm is uninterrupted.
+        let due_restore = self
+            .pending_restores
+            .values()
+            .any(|pending| pending.retry_at <= now);
+        let restore_lease = if due_restore {
+            acquire_session_lease(receiver_access, &mut self.lease)
+        } else {
+            None
+        };
+        if restore_lease.is_some() {
+            retry_pending_restores(&mut self.pending_restores, &channels.registry, now).await;
+        }
+
+        for plan in wanted {
+            let key = &plan.target.physical_key;
+            if self.sessions.contains_key(key) || self.pending_restores.contains_key(key) {
+                continue;
+            }
+            if self
+                .restart_after
+                .get(key)
+                .is_some_and(|deadline| *deadline > now)
+            {
+                continue;
+            }
+            self.restart_after.remove(key);
+            let Some(session_lease) = acquire_session_lease(receiver_access, &mut self.lease)
+            else {
+                self.restart_after.insert(key.clone(), now + RETRY_DELAY);
+                continue;
+            };
+            let id = HidppSessionId::new(&plan.dispatch.config_key);
+            let session = spawn_session(id, plan.clone(), session_lease, channels);
+            self.sessions.insert(key.clone(), session);
+        }
+    }
+
+    fn handle_session_event(
+        &mut self,
+        event: SessionEvent,
+        device_io_allowed: bool,
+        receiver_requests: &watch::Receiver<ReceiverRequestState>,
+        capture_plans: &watch::Receiver<Arc<Vec<DeviceCapturePlan>>>,
+    ) -> bool {
+        match event {
+            SessionEvent::Input(event) => {
+                let key = &event.physical_key;
+                if device_io_allowed && let Some(session) = self.sessions.get_mut(key) {
+                    reconcile_published_session(
+                        key,
+                        session,
+                        receiver_requests,
+                        capture_plans,
+                        &mut self.input_dispatcher,
+                    );
+                }
+                let live = self.sessions.get(key);
+                let dispatch_context = dispatch_context_for(&event.session, live);
+                if let Some((session, plan)) = dispatch_context {
+                    self.input_dispatcher.dispatch(session, plan, event.input);
+                } else {
+                    self.input_dispatcher.cancel_session(&event.session);
+                    debug!(
+                        key = key.as_str(),
+                        epoch = event.session.epoch(),
+                        "input from a stale capture session — ignored"
+                    );
+                }
+                false
+            }
+            SessionEvent::Done(done) => {
+                let key = &done.physical_key;
+                // Completion is queued behind every input the listener
+                // accepted during restoration, so cancellation cannot
+                // overtake the last diverted edge.
+                let Some((CompletionAction::Remove { unexpected }, dispatch_session)) = self
+                    .sessions
+                    .get(key)
+                    .map(|session| (session.completion(&done.session), session.id().clone()))
+                else {
+                    return false;
+                };
+                if let Some(pending) = done.pending_restore {
+                    self.pending_restores.insert(
+                        key.clone(),
+                        PendingRestore {
+                            token: pending,
+                            retry_at: Instant::now() + RETRY_DELAY,
+                        },
+                    );
+                }
+                self.input_dispatcher.cancel_session(&dispatch_session);
+                if device_io_allowed
+                    && let Some(deadline) = restart_deadline(unexpected, Instant::now())
+                {
+                    self.restart_after.insert(key.clone(), deadline);
+                    warn!(
+                        key = key.as_str(),
+                        "capture session ended unexpectedly, delaying re-arm"
+                    );
+                }
+                self.sessions.remove(key);
+                true
+            }
+        }
+    }
+}
+
+/// Keep one capture session alive per online device, restarting a session when
+/// its device's plan changes, and dispatch incoming inputs against the plan of
+/// the device they arrived on. Runs for the lifetime of the process.
+async fn manage(
+    mut capture_plans: watch::Receiver<Arc<Vec<DeviceCapturePlan>>>,
+    capture_channel: CaptureChannel,
+    receiver_access: ReceiverAccess,
+    mut receiver_requests: watch::Receiver<ReceiverRequestState>,
+    channel_registry: openlogi_hid::ChannelRegistry,
+    mut device_io: DeviceIoGate,
+    outputs: GestureOutputs,
+) {
+    let (events, mut event_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    let mut registry_changes = channel_registry.subscribe();
     // Capture sessions run as detached tasks, so an unexpected exit (a transient
     // HID++ read error, a sleep-wake glitch, brief radio loss) would otherwise go
-    // unnoticed: the tick below only restarts on a *changed* target, so a session
-    // that dies with the target unchanged leaves the gesture button and thumb
-    // wheel dead until the next carousel switch, config reload, or agent restart.
-    // Each session reports its completion here, tagged with the epoch it started
-    // under, so a dead *current* session can be re-armed while stale completions
-    // (from an already-superseded session) are ignored.
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<u64>();
-    let mut epoch: u64 = 0;
+    // unnoticed. Each session reports its completion here, tagged with its device
+    // key and the epoch it started under: a dead *current* session re-arms on the
+    // retry deadline, a deliberately stopped one immediately frees its key for the
+    // replacement once its teardown has drained, and stale completions are
+    // ignored by the shared capture-session lifecycle.
+    let channels = SessionChannels {
+        events,
+        capture: capture_channel,
+        registry: channel_registry,
+        device_io: device_io.clone(),
+    };
+    let mut state = GestureManagerState::new(outputs);
+    let mut reconcile = true;
 
     loop {
+        if reconcile {
+            reconcile = false;
+            let device_io_allowed = device_io.allows_io();
+            if device_io_allowed {
+                let requests = *receiver_requests.borrow_and_update();
+                let published = Arc::clone(&capture_plans.borrow_and_update());
+                state
+                    .reconcile(
+                        requests,
+                        device_io_allowed,
+                        &published,
+                        &receiver_access,
+                        &channels,
+                    )
+                    .await;
+            }
+        }
+
+        let requests = *receiver_requests.borrow();
+        let deadline = state.deadline(requests, device_io.allows_io());
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            reconcile = true;
+            continue;
+        }
+
         tokio::select! {
-            Some(input) = rx.recv() => {
-                dispatch(
-                    input,
-                    &mut accumulators,
-                    &hook_maps,
-                    &gesture_bindings,
-                    &dpi_cycle,
-                    &capture_channel,
-                    &thumbwheel_sensitivity,
+            Some(event) = event_rx.recv() => {
+                reconcile |= state.handle_session_event(
+                    event,
+                    device_io.allows_io(),
+                    &receiver_requests,
+                    &capture_plans,
                 );
             }
-            _ = ticker.tick() => {
-                // While pairing is waiting or active, release the capture
-                // session so run_pairing can own the receiver's HID node (one
-                // process can't read it through two channels).
-                let want = if receiver_access.pairing_requested() {
-                    None
-                } else {
-                    let target = dpi_cycle.read().ok().and_then(|guard| guard.target.clone());
-                    let sensitivity = thumbwheel_sensitivity.load(Ordering::Relaxed);
-                    // Divert the dedicated HID++ gesture button only while it owns the gesture role. The
-                    // shared gesture map is non-empty exactly then (gesture_bindings_for
-                    // gates on the owner), so it doubles as that signal — no need to
-                    // thread the full config in. Re-evaluated each tick, so a
-                    // ReloadConfig owner change restarts the session accordingly.
-                    let divert_gesture = gesture_bindings.read().is_ok_and(|g| !g.is_empty());
-                    target.map(|t| {
-                        (
-                            t,
-                            thumbwheel_armed(&hook_maps, sensitivity),
-                            divert_gesture,
-                        )
-                    })
-                };
-                if want == current {
-                    continue;
+            result = capture_plans.changed() => match result {
+                Ok(()) => reconcile = true,
+                Err(_) => return,
+            },
+            result = receiver_requests.changed() => match result {
+                Ok(()) => reconcile = true,
+                Err(_) => return,
+            },
+            allowed = device_io.changed() => match allowed {
+                Some(true) => reconcile = true,
+                Some(false) => {}
+                None => return,
+            },
+            open = wait_for_registry_change(
+                &mut registry_changes,
+                !state.pending_restores.is_empty(),
+            ) => {
+                if !open {
+                    return;
                 }
-                // Target or thumb-wheel arming changed (or first tick): stop the
-                // old session and start one for the new state. Sending on the
-                // oneshot lets the old session restore the diverted controls.
-                if let Some(stop) = stop.take() {
-                    let _ = stop.send(());
-                }
-                if current.is_some() {
-                    current = None;
-                    continue;
-                }
-                if let Some((route, capture_thumbwheel, divert_gesture_button)) = want {
-                    let Some(receiver_lease) = receiver_access.try_acquire_for_capture() else {
-                        current = None;
-                        continue;
-                    };
-                    current = Some((route.clone(), capture_thumbwheel, divert_gesture_button));
-                    let (stop_tx, stop_rx) = oneshot::channel();
-                    let sink = tx.clone();
-                    let slot = Arc::clone(&capture_channel);
-                    epoch = epoch.wrapping_add(1);
-                    let session_epoch = epoch;
-                    let done = done_tx.clone();
-                    tokio::spawn(async move {
-                        let _receiver_lease = receiver_lease;
-                        if let Err(e) = run_capture_session(
-                            route,
-                            capture_thumbwheel,
-                            divert_gesture_button,
-                            sink,
-                            stop_rx,
-                            slot,
-                        )
-                        .await
-                        {
-                            debug!(error = %e, "capture session ended");
-                        }
-                        // Report completion so the manager can re-arm if this exit
-                        // was unexpected rather than a deliberate stop.
-                        let _ = done.send(session_epoch);
-                    });
-                    stop = Some(stop_tx);
-                } else {
-                    current = None;
+                if device_io.allows_io() {
+                    state.expedite_pending_restores();
+                    reconcile = true;
                 }
             }
-            Some(done_epoch) = done_rx.recv() => {
-                // A capture session ended on its own. Re-arm only when it is the
-                // session we currently believe is live for an active target;
-                // clearing `current` lets the next tick start a fresh session.
-                // The tick fires at most once per `TARGET_POLL`, which paces the
-                // respawn so a permanently failing device can't hot-loop. A stale
-                // epoch or a deliberate stop-to-idle is a no-op (see `should_rearm`).
-                if should_rearm(done_epoch, epoch, current.is_some()) {
-                    warn!("capture session for the active device ended unexpectedly, re-arming");
-                    current = None;
-                    // Keep the `stop`/`current` invariant: the session already
-                    // exited, so its stop receiver is gone and dropping the sender
-                    // here is a no-op, but it stops the next tick from signalling a
-                    // session that no longer exists.
-                    stop = None;
-                }
+            () = wait_for_deadline(deadline) => {
+                reconcile = true;
             }
         }
     }
 }
 
-/// Per-direction wheel accumulators. The thumb wheel's two rotation directions
-/// bind to independent actions, so each keeps its own running total — sharing
-/// one would let a reversal cancel the other direction's progress.
-#[derive(Default)]
-struct WheelAccumulators {
-    up: WheelDirection,
-    down: WheelDirection,
-}
-
-/// Running state for one rotation direction.
-#[derive(Default)]
-struct WheelDirection {
-    /// Fractional line accumulator for continuous horizontal scroll.
-    scroll: f32,
-    /// Integer rotation-increment accumulator for a custom (non-scroll) action.
-    action: i32,
-    /// When the last rotation event for this direction arrived (decay clock).
-    last_event: Option<Instant>,
-    /// When this direction last fired its custom action (cooldown clock).
-    last_fired: Option<Instant>,
-}
-
-/// What advancing a direction's accumulator should produce.
-#[derive(Debug, PartialEq)]
-enum WheelOutput {
-    /// Below threshold / suppressed — emit nothing.
-    Idle,
-    /// Post this many horizontal scroll lines (signed: + right, − left).
-    Scroll(i32),
-    /// Fire the direction's bound custom action.
-    FireAction,
-}
-
-/// Route one captured input to its bound action (or re-synthesised scroll).
-fn dispatch(
-    input: CapturedInput,
-    accumulators: &mut WheelAccumulators,
-    hook_maps: &SharedHookMaps,
-    gesture_bindings: &GestureBindings,
-    dpi_cycle: &Arc<RwLock<DpiCycleState>>,
-    capture: &CaptureChannel,
-    thumbwheel_sensitivity: &ThumbwheelSensitivity,
-) {
-    match input {
-        CapturedInput::Gesture(direction) => {
-            let action = gesture_bindings
-                .read()
-                .ok()
-                .and_then(|guard| guard.get(&direction).cloned());
-            if let Some(action) = action {
-                debug!(?direction, action = %action.label(), "gesture → action");
-                hook_runtime::dispatch_action(&action, dpi_cycle, capture);
-            } else {
-                debug!(?direction, "gesture with no binding — ignored");
+/// Start one device's capture session plus its input-forwarding task, and
+/// return the manager's tracking entry for it.
+fn spawn_session(
+    id: HidppSessionId,
+    plan: DeviceCapturePlan,
+    lease: Arc<SessionReceiverLease>,
+    channels: &SessionChannels,
+) -> RunningSession {
+    let DeviceCapturePlan {
+        target, dispatch, ..
+    } = plan;
+    let physical_key = target.physical_key.clone();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    // Tag this session's inputs with its device key so dispatch resolves them
+    // against the right plan.
+    let (session_tx, session_rx) = mpsc::unbounded_channel::<CapturedInput>();
+    let forward_task = spawn_input_forwarder(
+        physical_key.clone(),
+        id.clone(),
+        session_rx,
+        channels.events.clone(),
+    );
+    let events = channels.events.clone();
+    let done_id = id.clone();
+    let done_key = physical_key;
+    let session_route = target.route.clone();
+    let session_spec = target.spec.clone();
+    let slot = Arc::clone(&channels.capture);
+    let registry = channels.registry.clone();
+    let device_io = channels.device_io.clone();
+    tokio::spawn(async move {
+        let _lease = lease;
+        let pending_restore = match run_capture_session_with_registry_spec(
+            session_route,
+            session_spec,
+            session_tx,
+            stop_rx,
+            slot,
+            &registry,
+            device_io,
+        )
+        .await
+        {
+            Ok(CaptureSessionOutcome::Restored) => None,
+            Ok(CaptureSessionOutcome::RestorePending(pending)) => Some(pending),
+            Err(failure) => {
+                let (error, pending) = failure.into_parts();
+                debug!(%error, "capture session ended");
+                pending
             }
-        }
-        CapturedInput::ButtonPressed(button) => {
-            let action = hook_maps
-                .read()
-                .ok()
-                .and_then(|maps| maps.bindings.get(&button).cloned());
-            if let Some(action) = action {
-                debug!(?button, action = %action.label(), "HID++ button → action");
-                hook_runtime::dispatch_action(&action, dpi_cycle, capture);
-            } else {
-                debug!(?button, "HID++ button with no binding — ignored");
-            }
-        }
-        CapturedInput::Scroll(rotation) => {
-            // Positive rotation is "up"; each direction has its own binding.
-            let up = rotation >= 0;
-            let button = if up {
-                ButtonId::ThumbwheelScrollUp
-            } else {
-                ButtonId::ThumbwheelScrollDown
-            };
-            let action = hook_maps
-                .read()
-                .ok()
-                .and_then(|maps| maps.bindings.get(&button).cloned())
-                .unwrap_or_else(|| default_binding(button));
-            let sensitivity = thumbwheel_sensitivity.load(Ordering::Relaxed);
-            let dir = if up {
-                &mut accumulators.up
-            } else {
-                &mut accumulators.down
-            };
-            let magnitude = i32::from(rotation).abs();
-            match advance(dir, &action, magnitude, sensitivity, Instant::now()) {
-                WheelOutput::Idle => {}
-                WheelOutput::Scroll(lines) => {
-                    openlogi_inject::post_horizontal_scroll(lines);
-                }
-                WheelOutput::FireAction => {
-                    debug!(?button, action = %action.label(), "thumb wheel → action");
-                    hook_runtime::dispatch_action(&action, dpi_cycle, capture);
-                }
-            }
-        }
-    }
-}
-
-/// Advance one direction's accumulator by `magnitude` rotation increments and
-/// decide what to emit. Pure given `now`, so the decay/cooldown/threshold logic
-/// is unit-testable without touching the OS.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    reason = "magnitude/sensitivity are small integers and `lines` is a trunc'd \
-              whole number — both well within f32/i32 range"
-)]
-fn advance(
-    dir: &mut WheelDirection,
-    action: &Action,
-    magnitude: i32,
-    sensitivity: i32,
-    now: Instant,
-) -> WheelOutput {
-    match action {
-        // Suppressed: captured but produces nothing.
-        Action::None => WheelOutput::Idle,
-        // Continuous, sensitivity-scaled horizontal scroll. Direction comes
-        // from the action; magnitude from the accumulated rotation.
-        Action::HorizontalScrollRight | Action::HorizontalScrollLeft => {
-            dir.scroll += magnitude as f32 * scroll_multiplier(sensitivity);
-            let lines = dir.scroll.trunc();
-            if lines >= 1.0 {
-                dir.scroll -= lines;
-                let sign = if matches!(action, Action::HorizontalScrollRight) {
-                    1
-                } else {
-                    -1
-                };
-                WheelOutput::Scroll(sign * lines as i32)
-            } else {
-                WheelOutput::Idle
-            }
-        }
-        // Any other action: fire once per `action_threshold` increments, with
-        // decay (forget stale partial progress) and cooldown (one flick = one
-        // fire).
-        _ => {
-            if dir
-                .last_event
-                .is_some_and(|t| now.saturating_duration_since(t) > ACTION_DECAY)
-            {
-                dir.action = 0;
-            }
-            dir.last_event = Some(now);
-
-            if dir
-                .last_fired
-                .is_some_and(|t| now.saturating_duration_since(t) < ACTION_COOLDOWN)
-            {
-                return WheelOutput::Idle;
-            }
-
-            dir.action += magnitude;
-            if dir.action >= action_threshold(sensitivity) {
-                dir.action = 0;
-                dir.last_fired = Some(now);
-                WheelOutput::FireAction
-            } else {
-                WheelOutput::Idle
-            }
-        }
-    }
+        };
+        // Use the same channel as input so completion follows every diverted
+        // report accepted before the listener was dropped.
+        report_done_after_inputs(
+            forward_task,
+            events,
+            SessionDone {
+                physical_key: done_key,
+                session: done_id,
+                pending_restore,
+            },
+        )
+        .await;
+    });
+    CaptureSession::active(id, target, dispatch, stop_tx)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn multiplier_is_unity_at_default_sensitivity() {
-        assert!((scroll_multiplier(DEFAULT_THUMBWHEEL_SENSITIVITY) - 1.0).abs() < f32::EPSILON);
-        assert!(scroll_multiplier(DEFAULT_THUMBWHEEL_SENSITIVITY * 2) > 1.9);
-        assert!(scroll_multiplier(1) < 0.1);
-    }
-
-    #[test]
-    fn action_threshold_drops_with_sensitivity_and_floors_at_one() {
-        assert_eq!(
-            action_threshold(DEFAULT_THUMBWHEEL_SENSITIVITY),
-            DEFAULT_THUMBWHEEL_SENSITIVITY
-        );
-        assert!(
-            action_threshold(1) > action_threshold(DEFAULT_THUMBWHEEL_SENSITIVITY),
-            "low sensitivity needs more increments"
-        );
-        assert_eq!(action_threshold(100), 1, "high sensitivity floors at one");
-    }
-
-    #[test]
-    fn scroll_accumulates_fractionally_at_sub_unity_sensitivity() {
-        let mut dir = WheelDirection::default();
-        let now = Instant::now();
-        // multiplier 0.5: two increments make one whole line.
-        let half = DEFAULT_THUMBWHEEL_SENSITIVITY / 2;
-        assert_eq!(
-            advance(&mut dir, &Action::HorizontalScrollRight, 1, half, now),
-            WheelOutput::Idle
-        );
-        assert_eq!(
-            advance(&mut dir, &Action::HorizontalScrollRight, 1, half, now),
-            WheelOutput::Scroll(1)
-        );
-    }
-
-    #[test]
-    fn scroll_left_emits_negative_lines() {
-        let mut dir = WheelDirection::default();
-        let now = Instant::now();
-        assert_eq!(
-            advance(
-                &mut dir,
-                &Action::HorizontalScrollLeft,
-                1,
-                DEFAULT_THUMBWHEEL_SENSITIVITY,
-                now
-            ),
-            WheelOutput::Scroll(-1)
-        );
-    }
-
-    #[test]
-    fn directions_accumulate_independently() {
-        // A reversal must not drain the other direction's pending progress.
-        let mut up = WheelDirection::default();
-        let mut down = WheelDirection::default();
-        let now = Instant::now();
-        let half = DEFAULT_THUMBWHEEL_SENSITIVITY / 2; // multiplier 0.5
-        assert_eq!(
-            advance(&mut up, &Action::HorizontalScrollRight, 1, half, now),
-            WheelOutput::Idle
-        );
-        // One tick the other way doesn't cancel `up`'s banked half-line…
-        assert_eq!(
-            advance(&mut down, &Action::HorizontalScrollLeft, 1, half, now),
-            WheelOutput::Idle
-        );
-        // …so `up`'s next tick still completes its own line.
-        assert_eq!(
-            advance(&mut up, &Action::HorizontalScrollRight, 1, half, now),
-            WheelOutput::Scroll(1)
-        );
-    }
-
-    #[test]
-    fn custom_action_fires_on_threshold_then_respects_cooldown() {
-        let mut dir = WheelDirection::default();
-        let now = Instant::now();
-        // Threshold at default sensitivity is DEFAULT increments.
-        for _ in 0..DEFAULT_THUMBWHEEL_SENSITIVITY - 1 {
-            assert_eq!(
-                advance(
-                    &mut dir,
-                    &Action::VolumeUp,
-                    1,
-                    DEFAULT_THUMBWHEEL_SENSITIVITY,
-                    now
-                ),
-                WheelOutput::Idle
-            );
-        }
-        assert_eq!(
-            advance(
-                &mut dir,
-                &Action::VolumeUp,
-                1,
-                DEFAULT_THUMBWHEEL_SENSITIVITY,
-                now
-            ),
-            WheelOutput::FireAction
-        );
-        // Immediately after, the cooldown swallows further increments.
-        for _ in 0..DEFAULT_THUMBWHEEL_SENSITIVITY {
-            assert_eq!(
-                advance(
-                    &mut dir,
-                    &Action::VolumeUp,
-                    1,
-                    DEFAULT_THUMBWHEEL_SENSITIVITY,
-                    now
-                ),
-                WheelOutput::Idle
-            );
-        }
-    }
-
-    #[test]
-    fn none_action_is_suppressed() {
-        let mut dir = WheelDirection::default();
-        assert_eq!(
-            advance(
-                &mut dir,
-                &Action::None,
-                5,
-                DEFAULT_THUMBWHEEL_SENSITIVITY,
-                Instant::now()
-            ),
-            WheelOutput::Idle
-        );
-    }
-
-    #[test]
-    fn rearms_when_the_current_session_dies_with_a_target() {
-        // The live session ended on its own while a device is still targeted.
-        assert!(should_rearm(7, 7, true));
-    }
-
-    #[test]
-    fn ignores_a_stale_session_superseded_by_a_restart() {
-        // An older session reports completion after a deliberate restart already
-        // bumped the epoch; re-arming would needlessly cycle the live session.
-        assert!(!should_rearm(6, 7, true));
-    }
-
-    #[test]
-    fn ignores_a_deliberate_stop_to_idle() {
-        // The session was stopped on purpose (pairing took the receiver, or no
-        // device is targeted): no target means there is nothing to re-arm.
-        assert!(!should_rearm(7, 7, false));
-    }
-}
+mod tests;

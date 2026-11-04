@@ -1,0 +1,23 @@
+[package]
+name = "openlogi-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The tarpc contract and local-socket transport shared by the OpenLogi agent and GUI."
+
+[dependencies]
+openlogi-core = { path = "../openlogi-core", version = "0.8.3" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tarpc = { workspace = true }
+interprocess = { workspace = true }
+succession = { version = "0.2", features = ["serde"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+bincode = "1.3"

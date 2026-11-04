@@ -1,7 +1,10 @@
 //! `openlogi diag dpi` — DPI write round-trip.
 
+use std::fmt;
+
 use anyhow::{Context, Result};
 use clap::Args;
+use openlogi_hid::DpiCapabilities;
 
 use crate::cmd::diag::select_device;
 
@@ -20,8 +23,9 @@ pub struct DpiArgs {
 }
 
 pub async fn run(args: DpiArgs) -> Result<()> {
-    // 0x2201 = AdjustableDpi — auto-skip devices (keyboards) that lack it.
-    let (route, name) = select_device(args.device.as_deref(), &[0x2201]).await?;
+    // 0x2201 AdjustableDpi / 0x2202 ExtendedAdjustableDpi — auto-skip devices
+    // (keyboards) that expose neither. Newer mice ship only 0x2202.
+    let (route, name) = select_device(args.device.as_deref(), &[0x2201, 0x2202]).await?;
     println!("device: {name} ({route})");
 
     let info = openlogi_hid::get_dpi_info(&route)
@@ -29,14 +33,15 @@ pub async fn run(args: DpiArgs) -> Result<()> {
         .context("read DPI capabilities")?;
     let before = info.current;
     println!("  current DPI: {before}");
-    println!("  supported DPI: {}", summarize_dpi(&info.capabilities));
+    println!("  supported DPI: {}", DpiSummaryDisplay(&info.capabilities));
 
     let target = match args.target {
         Some(target) => {
+            let target = target.into();
             if !info.capabilities.contains(target) {
                 anyhow::bail!(
                     "target {target} is not in the device-reported DPI list ({})",
-                    summarize_dpi(&info.capabilities)
+                    DpiSummaryDisplay(&info.capabilities)
                 );
             }
             target
@@ -90,20 +95,56 @@ pub async fn run(args: DpiArgs) -> Result<()> {
     Ok(())
 }
 
-fn summarize_dpi(capabilities: &openlogi_hid::DpiCapabilities) -> String {
-    let values = capabilities.values();
-    let step = capabilities.step_hint();
-    if values.len() <= 12 {
-        return values
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
+struct DpiSummaryDisplay<'a>(&'a DpiCapabilities);
+
+impl fmt::Display for DpiSummaryDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let capabilities = self.0;
+        let values = capabilities.values();
+        if values.len() <= 12 {
+            let mut separator = "";
+            for value in values {
+                write!(f, "{separator}{value}")?;
+                separator = ", ";
+            }
+            return Ok(());
+        }
+        write!(
+            f,
+            "{}..{} (step ≈ {}, {} values)",
+            capabilities.min(),
+            capabilities.max(),
+            capabilities.step_hint(),
+            values.len()
+        )
     }
-    format!(
-        "{}..{} (step ≈ {step}, {} values)",
-        capabilities.min(),
-        capabilities.max(),
-        values.len()
-    )
+}
+
+#[cfg(test)]
+mod summarize_dpi_tests {
+    use openlogi_hid::DpiCapabilities;
+
+    use super::DpiSummaryDisplay;
+
+    #[test]
+    fn lists_values_verbatim_at_the_twelve_value_boundary() {
+        let values: Vec<u16> = (1..=12).map(|n| n * 100).collect();
+        let caps = DpiCapabilities::new(values).expect("non-empty");
+
+        assert_eq!(
+            DpiSummaryDisplay(&caps).to_string(),
+            "100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200"
+        );
+    }
+
+    #[test]
+    fn switches_to_a_range_summary_past_twelve_values() {
+        let values: Vec<u16> = (1..=13).map(|n| n * 100).collect();
+        let caps = DpiCapabilities::new(values).expect("non-empty");
+
+        assert_eq!(
+            DpiSummaryDisplay(&caps).to_string(),
+            "100..1300 (step ≈ 100, 13 values)"
+        );
+    }
 }

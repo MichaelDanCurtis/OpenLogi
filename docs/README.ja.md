@@ -1,5 +1,5 @@
 > [!WARNING]
-> **OpenLogi は現在活発に開発中**であり、まだ安定していません —— 機能や設定は今後も変わる可能性があります。リポジトリに **Star** ⭐ と **Watch** 👀 を付けて、リリースが出た瞬間に通知を受け取りましょう。
+> **OpenLogi は現在活発に開発中**であり、まだ安定していません —— 機能や設定は今後も変わる可能性があります。リポジトリに **Star** ⭐ と **Watch** 👀 を付けて、新しいリリースの通知を受け取りましょう。
 
 <h4 align="right"><a href="../README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | <strong>日本語</strong> | <a href="README.de.md">Deutsch</a> | <a href="README.fr.md">Français</a> | <a href="README.ko.md">한국어</a></h4>
 
@@ -8,7 +8,7 @@
 </p>
 
 <h1 align="center">OpenLogi</h1>
-<p align="center"><strong>⚡️ Rust 製のネイティブでローカルファーストな Logitech Options+ 代替 🦀<br/>HID++ でボタン・DPI・SmartShift を再マッピング。アカウント不要、テレメトリなし。</strong></p>
+<p align="center"><strong>⚡️ Rust 製のネイティブでローカルファーストな Logitech Options+ 代替 🦀<br/>HID++ と UVC で Logitech のマウス・キーボード・ウェブカメラの能力を最大限に引き出す</strong></p>
 
 
 <div align="center">
@@ -30,53 +30,49 @@
 
 > **Options+ にうんざり？OpenLogi をどうぞ。**
 
-Logitech アカウントもテレメトリも公式 Options+ のインストールも不要で、ボタンの再マッピング、DPI と SmartShift の制御、アプリごとのプロファイル切り替えができます。クラウドなし、設定はプレーンな TOML ファイル。ネットワーク通信はデバイス画像の取得と、デフォルトオフのオプトイン更新チェックだけです。
+macOS、Linux、Windows に対応。
 
 ---
-
-## 概要
-
-OpenLogi は Logi Bolt レシーバー経由 —— あるいは Bluetooth 直結 / 有線接続 —— で Logitech の HID++ マウスと通信します。Logi Options+ を動かす必要はありません。2 つのバイナリを提供します：
-
-- **[OpenLogi GUI](../crates/openlogi-gui)** —— GPUI 製デスクトップアプリ：クリック可能なホットスポット付きのインタラクティブなマウス図、ボタンごとのアクションピッカー（41 種の組み込みアクション + TOML 設定に手書きするカスタムショートカット）、DPI プリセット、SmartShift パネル（ホイールモード・感度・永続ラチェット）、アプリごとのプロファイルオーバーレイ、ペアリング済みデバイスをライブで切り替えるデバイスカルーセル、そして 20 言語にローカライズされた設定ウィンドウ。
-- **[OpenLogi CLI](../crates/openlogi-cli)** —— ヘッドレスなデバイス一覧（`list`）、アセット同期、デバイス診断のサブコマンドを備えた CLI。
-
-すべてはローカルで完結します：バインディングはプレーンな TOML ファイルに保存され、ボタン入力は OS のイベントフックで再マッピングされ、DPI / SmartShift の変更は HID++ で直接デバイスに書き込まれます。
-
-macOS と Linux をサポートしています。Windows は未検証の早期プレビューで、各リリースに署名済みビルドが付属します —— [ロードマップ](#ロードマップ)を参照。
 
 ## Options+ を超えて
 
 OpenLogi にできて Options+ にできないこと：
 
-- **Linux で動く。** Options+ は macOS と Windows のみ。OpenLogi は Linux をファーストクラスで扱います：evdev/uinput フック、udev ルール、systemd ユーザーユニット、`.deb` / `.rpm` パッケージ。
-- **ジェスチャーボタンを移せる。** どの物理ボタンがジェスチャー役を担うか —— サムパッド、ミドル、戻る、進む —— を選べ、方向ごとのスワイプバインディングを設定でき、ジェスチャーを完全にオフにもできます。Options+ はジェスチャーを専用サムパッドに固定しています。
-- **設定がプレーンテキスト。** すべてが 1 つの TOML ファイル。読めて、diff できて、バージョン管理に入れられて、マシン間でコピーできます。
-- **スクリプトで叩ける。** 本物の CLI：デバイス一覧、アセットのプリフェッチ、デバイス上での HID++ 診断（フィーチャーダンプ、DPI / SmartShift のラウンドトリップ検査）。
-- **軽量なまま。** ネイティブ Rust + GPUI バイナリ —— Electron スイートも常駐アップデーターもアカウントもテレメトリもなし。
+- **軽量なまま。** ネイティブ Rust + GPUI。
+- **Linux で動く。** Linux は OpenLogi のファーストクラスプラットフォームです。
+- **ジェスチャーボタンを自由に。** どの物理ボタンにでもジェスチャー役を割り当てられ、ジェスチャーを完全にオフにもできます。
+- **設定がプレーンテキスト。** すべてが 1 つの TOML ファイルに収まり、好きな方法でマシン間を同期できます。
+- **スクリプトで叩ける。** GUI に加えて本物の CLI も。
 
-## ロードマップ
+## 機能一覧
 
-| 機能 | 状態 |
-|---|---|
-| Bolt レシーバーの発見 + ペアリング済みデバイスの一覧（CLI + GUI） | ✅ |
-| Unifying レシーバー（Bolt に置き換えられた旧プロトコル） | ✅ |
-| Bluetooth 直結 / 有線デバイス（レシーバーなし） | ✅ |
-| バッテリー残量 / 充電状態 | ✅（オンラインのデバイス） |
-| インタラクティブ GUI：カルーセル、マウス図、アクションピッカー | ✅ macOS + Linux |
-| OS イベントフック / evdev によるボタン再マッピング | ✅ macOS + Linux |
-| 41 アクションのカタログ + カスタムキーボードショートカット（TOML 手書き） | ✅ macOS + Linux¹ |
-| DPI 制御 + プリセット + サイクル / プリセット指定アクション（HID++ `0x2201`） | ✅ |
-| SmartShift ホイール：モード切替 + 感度 + 永続ラチェットパネル（HID++ `0x2111`） | ✅ |
-| アプリごとのプロファイルオーバーレイ（フォーカスで自動切替） | ✅ macOS、🟡 Linux（X11 のみ） |
-| 設定ウィンドウ：ログイン時起動、更新チェック、メニューバー、権限、言語 | ✅ macOS + Linux |
-| UI のローカライズ（20 言語：da、de、el、en、es、fi、fr、it、ja、ko、nb、nl、pl、pt-BR、pt-PT、ru、sv、zh-CN、zh-HK、zh-TW） | ✅ |
-| Linux パッケージング：udev ルール、systemd ユニット、`.deb` / `.rpm` | ✅ Linux |
-| ジェスチャーボタンの方向別バインディング | 🟡 設定可能；ハードウェアキャプチャは開発中 |
-| ミドル / モードシフト / サムホイールボタンのキャプチャ | 🟡 設定可能；フックが扱うのは現状サイドボタンのみ |
-| Windows（agent、GUI、イベントフック） | 🟡 未検証プレビュー —— 各リリースに署名済み `.exe` / `.msi` が付属 |
+- Logi Bolt / Unifying レシーバー、Bluetooth、有線で接続されたデバイスに対応し、バッテリー残量と充電状態を表示
+- OS 入力フックによるボタン再マッピング：組み込みアクションカタログ + カスタムキーボードショートカット（TOML で作成）¹
+- アプリごとのプロファイルオーバーレイ（フォーカスで自動切替；macOS + Windows、Linux は X11 / XWayland のみ）
+- Litra ライト：電源、明るさ、色温度。カメラの使用状況に連動した自動オン / オフも可能
 
-¹ Linux のメディアキーアクションは D-Bus MPRIS を使います。macOS 固有の一部アクション（Launchpad など）は Linux に対応物がなく、no-op になります。
+**マウス**
+
+- ミドル、モードシフト、サムホイールなどのボタンのキャプチャと再マッピング（ミドルは全プラットフォーム対応、その他はデバイス機能に依存）
+- 方向別ジェスチャーバインディングとライブキャプチャ（対応する任意のボタンに設定可能）
+- Actions Ring：カーソル中心の 8 スロットアクションオーバーレイ（`ShowActionsRing`）、アプリごとのレイアウトに対応
+- DPI 制御：プリセット + サイクル / プリセット指定アクション（`0x2201`）
+- SmartShift ホイール：モード切替、感度、永続ラチェットパネル（`0x2111`）
+- デバイスごとのネイティブスクロール反転（`0x2121`、対応デバイス）
+
+**キーボード**
+
+- F キーのグローバル再マッピング：マウスと同じアクションカタログに加え、テキスト入力、キーコンボ、複数ステップのワークフローなどのパワーユーザーアクション（macOS + Windows）
+- 静的 RGB ライティング（`0x8070` / `0x8080`、対応デバイス）
+
+**カメラ**
+
+- あらゆる Logitech UVC ウェブカメラ（Brio、StreamCam、C920 シリーズなど）にプラグアンドプレイで対応
+- ライブプレビュー：見ているあいだだけカメラを起動し、離れると完全に解放されて LED も消灯
+- 画質コントロールは UVC ハードウェアへ直接書き込み：ズーム、フォーカス、露出、明るさ、コントラスト、彩度、シャープネス、ホワイトバランス、色合い。フォーカス / 露出 / ホワイトバランスは自動モード切替付きで、Meet / Zoom / OBS などカメラを使うすべてのアプリに反映
+- ワンクリックプロファイル：組み込みの「デフォルト / 配信 / ビデオ通話」に加えてカスタムスナップショットを保存可能。設定はカメラごとに保持され、次回表示時にハードウェアへ書き戻されます
+
+¹ Linux のメディアキーアクションは D-Bus MPRIS を使います。少数の macOS 固有アクションには Linux で汎用的な対応物がなく、no-op になります。Windows では利用可能なプラットフォームアクションをネイティブの対応機能に割り当てます。
 
 ## インストール
 
@@ -84,6 +80,8 @@ OpenLogi にできて Options+ にできないこと：
 > 先に **Logi Options+** を終了してください —— 両者は HID++ アクセスを奪い合い、1 つのレシーバーを同時に所有できるのは片方だけです。
 
 ### macOS
+
+macOS 13 以降が必要です。
 
 [最新リリース](https://github.com/AprilNEA/OpenLogi/releases/latest)から署名・公証済みの `.dmg` をダウンロードし、`OpenLogi.app` を `/Applications` にドラッグします。
 
@@ -112,6 +110,9 @@ sudo dpkg -i openlogi_*.deb
 
 # Fedora / RHEL
 sudo rpm -i openlogi-*.rpm
+
+# Arch Linux
+sudo pacman -U openlogi-*.pkg.tar.zst
 ```
 
 パッケージは `x86_64`/`amd64` と `arm64`/`aarch64` の両方で公開されています。
@@ -124,9 +125,11 @@ systemctl --user enable --now openlogi-agent.service
 
 手動 / ソースからのインストールや systemd のないディストリビューションは [INSTALL-linux.md](INSTALL-linux.md) を参照。
 
-### Windows（プレビュー）
+### Windows
 
-各リリースに署名済み `.exe` とユーザー単位の `.msi` インストーラー（x86_64 と arm64）が付属します。Windows サポートは実機での検証がまだ十分でない早期プレビューです —— 粗削りな部分はご容赦のうえ、[issue で報告](https://github.com/AprilNEA/OpenLogi/issues)してください。
+各リリースには署名済みポータブル `.zip` とユーザー単位の `.msi` インストーラー（x86_64 / arm64）が付属します。どちらも GUI（`OpenLogi.exe`）と、すべてのデバイス I/O を所有するバックグラウンド agent（`openlogi-agent.exe`）を同梱します。ポータブル zip では 2 ファイルを同じ場所に置いてください。そうしないと GUI は接続先を失います。
+
+Windows サポートは動作しており、有線キーボードと Unifying レシーバー接続のマウスを使い、MSI のインストール、インプレースアップグレード、アンインストールを含めて Windows 11 実機でエンドツーエンド検証済みです。macOS 版より新しいため、問題があれば[報告](https://github.com/AprilNEA/OpenLogi/issues)してください。agent はシステムトレイアイコン（メインウィンドウを表示 / 終了）を表示し、メインウィンドウを閉じてもアプリを開けます。Windows で無効にするには TOML の `[app_settings]` ブロックで `show_in_menu_bar = false` を設定し、agent を再起動してください。GUI の切り替えは現在 macOS 専用です。
 
 ソースからのビルドは [DEVELOPMENT.md](DEVELOPMENT.md) を参照。
 
@@ -145,20 +148,25 @@ systemctl --user enable --now openlogi-agent.service
 
 ## 謝辞
 
-- [`hidpp`](https://crates.io/crates/hidpp) by [@lus](https://github.com/lus)
-- [Solaar](https://github.com/pwr-Solaar/Solaar)
-- [Mouser](https://github.com/TomBadash/Mouser) by Tom Badash
+- **Windows・カメラ・i18n**: [@davidbudnick](https://github.com/davidbudnick) —— キーボード RGB 対応、Windows 対応、Logitech ウェブカメラ対応
+- **Linux 移植**: [@cserby](https://github.com/cserby) —— Linux 対応
+- [Solaar](https://github.com/pwr-Solaar/Solaar) by [@pwr](https://github.com/pwr) —— オープンソースの HID++ 実装
+- [Mouser](https://github.com/TomBadash/Mouser) by [@TomBadash](https://github.com/TomBadash) —— ローカル完結・アカウント不要の Options+ 代替
 
 ## ライセンス
 
-以下のいずれかを選択できます：
+本リポジトリのコードは、以下のいずれかのライセンスを選択できます：
 
 - Apache License 2.0（[LICENSE-APACHE](../LICENSE-APACHE)）
 - MIT ライセンス（[LICENSE-MIT](../LICENSE-MIT)）
 
+### サードパーティコード
+
+`crates/openlogi-hidpp` は [`hidpp`](https://crates.io/crates/hidpp)（作者 [@lus](https://github.com/lus)）の vendored fork で、0BSD ライセンスです。
+
 ### ロゴとブランドアセット
 
-OpenLogi のロゴとアプリアイコン —— [`design/`](../design/) 配下のブランドアセット —— は © 2026 AprilNEA が全権利を留保しており、上記の MIT/Apache ライセンスの対象外です。[`design/LICENSE`](../design/LICENSE) を参照してください。コードをフォークしても OpenLogi の名称・ロゴ・アイコンの使用権は付与されません。事前の書面による許可なく、ご自身のプロジェクト、フォーク、配布物を表すために使用しないでください。
+OpenLogi のロゴをデザインしてくれた [@kubai087](https://github.com/kubai087) に感謝します。OpenLogi のロゴとアプリアイコン —— [`design/`](../design/) 配下のブランドアセット —— は © 2026 AprilNEA が全権利を留保しており、上記の MIT/Apache ライセンスの対象外です。[`design/LICENSE`](../design/LICENSE) を参照してください。コードをフォークしても OpenLogi の名称・ロゴ・アイコンの使用権は付与されません。事前の書面による許可なく、ご自身のプロジェクト、フォーク、配布物を表すために使用しないでください。
 
 ---
 

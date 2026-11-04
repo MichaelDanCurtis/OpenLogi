@@ -6,22 +6,82 @@
 //! as `"receiver:abc123:slot:2"`. Schema migrations branch on
 //! [`Config::schema_version`].
 
-use std::{
-    collections::BTreeMap,
-    fs, io,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, path::Path};
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-use crate::binding::{Action, Binding, ButtonId, GestureDirection, default_binding_for};
-use crate::device::{Capabilities, DeviceKind, DeviceModelInfo};
-use crate::paths::{self, PathsError};
+mod device;
+#[cfg(feature = "fs")]
+mod file;
+mod host_switch;
+mod identity;
+mod key_trigger;
+mod settings;
 
-/// The schema version the current build produces. Bumped on breaking layout
-/// changes; readers branch on the parsed value before consuming the rest of
-/// the file.
+// Stacked, not `all(test, …)`: clippy reads the combined form as a test
+// outside a test module and withdraws the `unwrap`/`expect` exemption.
+#[cfg(test)]
+#[cfg(feature = "fs")]
+mod tests;
+
+pub use device::{DeviceConfig, DeviceIdentity, LinkConfig, LinkOverrides};
+#[cfg(feature = "fs")]
+pub use file::{ConfigError, ConfigFile};
+#[cfg(all(test, feature = "fs"))]
+use file::{backup_existing_config, config_backup_path};
+pub use host_switch::{HostSwitchActions, HostSwitchTrigger};
+pub use identity::canonical_device_key;
+pub use key_trigger::{KeyModifiers, KeyTrigger, KeyboardConfig, ParseTriggerError};
+pub use settings::LightSettings;
+pub use settings::{
+    AppIcon, AppSettings, Appearance, AssetSourcePreference, CameraControls, DeviceViewMode,
+    Lighting, SMARTSHIFT_AUTO_DISENGAGE_DEFAULT, SMARTSHIFT_MIN_AUTO_DISENGAGE, ScrollResolution,
+    SmartShift, ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity, WheelMode,
+};
+
+use crate::binding::{
+    Action, ActionRingConfig, ActionRingIcon, ActionRingSlot, Binding, ButtonId, GestureDirection,
+    RingAction, default_binding, default_binding_for, default_gesture_binding,
+};
+use crate::device_order::PhysicalDeviceKey;
+use crate::hid::Dpi;
+#[cfg(feature = "fs")]
+use settings::GestureOwner;
+/// The schema version the current build produces. Bumped whenever the
+/// persisted shape or enum vocabulary changes; readers inspect this value
+/// before consuming the rest of the file.
+///
+/// v7 aligns the thumb-wheel scroll defaults with its normalised physical
+/// direction. Pre-v7 explicit default pairs are migrated in device and
+/// per-application profiles so they remain native rather than becoming a
+/// reversal (see `Config::migrate_thumbwheel_native_direction`).
+///
+/// v6 adds threshold-based `{ short = ..., long = ... }` button bindings.
+///
+/// v5 also drops the transport prefix from `direct:` keys: `direct:046d:c08d:unit:6be9d300`
+/// names the mouse *and the cable it was plugged into*, so a device moved to a
+/// different route was silently orphaned from its settings.
+/// [`Config::migrate_transport_scoped_keys`] rewrites such a key to its bare
+/// identity fragment (`unit:6be9d300`) — including `selected_device` and every
+/// `host_switch_targets` entry — and keeps the dropped route as a
+/// [`DeviceConfig::links`] entry. `receiver:` keys are left alone: nothing on
+/// disk says which device occupies a pairing slot, so those are folded at
+/// runtime instead, on the next online sighting (see `adopt_route`).
+///
+/// v5 adds the app-wide `ui_scale` preference. Older files default to the
+/// standard 100% scale.
+///
+/// Per-device custom names and the Home gallery view preference are optional
+/// and did not require a version bump: absent fields use the model name and
+/// responsive grid respectively.
+///
+/// v4 removes the one-gesture-button-per-device owner lock: gesture mode is a
+/// per-button fact read from the binding shape, so `gesture_owner` no longer
+/// serializes. Loading a v3-or-older file resolves the old owner and rewrites
+/// the shapes to dispatch identically
+/// (see `Config::migrate_owner_locked_gestures`); the version gate is what
+/// keeps that pass off v4 files, where several gesture-shaped buttons are a
+/// deliberate state, not a dormant leftover.
 ///
 /// v3 changes the device map from model keys to physical-device keys. No v2
 /// device entries are migrated because model-scoped settings cannot be assigned
@@ -30,24 +90,51 @@ use crate::paths::{self, PathsError};
 /// v2 merged the per-device `button_bindings` + `gesture_bindings` maps into a
 /// single `bindings: BTreeMap<ButtonId, Binding>`. A v1 file still loads (the
 /// `RawDeviceConfig` shim folds the legacy fields) and self-heals to v2 on the
-/// next save; [`Config::load_from_path`] rejects only versions *newer* than this
-/// so a forward file fails loudly instead of silently losing bindings.
-pub const SCHEMA_VERSION: u32 = 3;
+/// next save; [`Config::load_from_path`] accepts supported versions `1` through
+/// [`SCHEMA_VERSION`] so an invalid or forward file fails loudly instead of
+/// silently losing bindings.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Top-level config document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Schema version the file was written with. Compared against
+    /// [`SCHEMA_VERSION`] on load: supported older layouts migrate, while zero
+    /// and newer layouts are rejected rather than silently losing settings.
     pub schema_version: u32,
     /// Non-device-scoped preferences (autostart, tray, language, …).
     #[serde(default, skip_serializing_if = "AppSettings::is_default")]
     pub app_settings: AppSettings,
-    /// Physical config key of the carousel-selected device, persisted so a
+    /// Physical config key of the active device, persisted so a
     /// restart restores the last view rather than always landing on the
     /// first paired device. `None` means "fall back to the first device".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_device: Option<String>,
+    /// When set (see [`Self::ephemeral`]), [`Self::save_atomic`] is a no-op:
+    /// this config never writes the on-disk file. Never true for a loaded or
+    /// default-constructed config.
+    #[serde(skip)]
+    // Read only by the `fs` half, which is where saving happens. The field
+    // stays in every build: `Config::ephemeral()` is public API, and a field
+    // that exists conditionally is a struct whose shape depends on a feature.
+    #[cfg_attr(
+        not(feature = "fs"),
+        expect(clippy::allow_attributes, reason = "see above"),
+        allow(dead_code, reason = "only the `fs` half suppresses a save")
+    )]
+    ephemeral: bool,
+    /// Per-device state, normally keyed by the stable physical-device
+    /// identifier (e.g. `"receiver:abc123:slot:2"`). A serial-less camera's
+    /// custom name instead uses its OS capture id so same-model cameras remain
+    /// distinguishable.
     #[serde(default)]
     pub devices: BTreeMap<String, DeviceConfig>,
+    /// Keyboard remappings, independent of device. The function-key remapper
+    /// (M1) reads this; `#[serde(default)]` keeps older configs without a
+    /// `[keyboard]` section loading unchanged.
+    #[serde(default)]
+    pub keyboard: KeyboardConfig,
 }
 
 impl Default for Config {
@@ -57,572 +144,23 @@ impl Default for Config {
             app_settings: AppSettings::default(),
             selected_device: None,
             devices: BTreeMap::new(),
+            ephemeral: false,
+            keyboard: KeyboardConfig::default(),
         }
     }
 }
 
-/// Light/dark appearance preference. `System` follows the OS appearance (the
-/// historical behaviour); `Light` / `Dark` force a mode regardless of the OS.
-/// Platform-free so the core crate stays GUI-agnostic — the GUI maps this onto
-/// gpui-component's `ThemeMode`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Appearance {
-    /// Follow the operating system's light/dark setting.
-    #[default]
-    System,
-    /// Always use the light variant of the selected theme.
-    Light,
-    /// Always use the dark variant of the selected theme.
-    Dark,
-}
-
-/// App-wide preferences not tied to any particular device.
-///
-/// All fields are `#[serde(default)]` so adding a new one is backward
-/// compatible — old config files just keep the default for the new field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "independent on/off user preferences, not a state machine"
-)]
-pub struct AppSettings {
-    /// When true, a macOS `LaunchAgent` plist at
-    /// `~/Library/LaunchAgents/org.openlogi.openlogi.plist` is installed
-    /// so the app starts on login (P2.2). The plist is reconciled with
-    /// this field on every startup; flipping the flag and relaunching is
-    /// enough to install / remove it.
-    #[serde(default)]
-    pub launch_at_login: bool,
-    /// Opt-in update check (P2.8). **Off by default** to honour the
-    /// README's "no telemetry, no auto-update poller" promise. When true,
-    /// the app makes exactly one `HEAD /repos/AprilNEA/OpenLogi/releases/
-    /// latest` request per launch and logs whether a newer version is
-    /// available — no automatic download.
-    #[serde(default)]
-    pub check_for_updates: bool,
-    /// Opt-in automatic install. When true *and* [`Self::check_for_updates`]
-    /// surfaces a newer version, the GUI downloads and stages it in the
-    /// background; the update is applied on the next restart (never mid-session,
-    /// and never auto-relaunched). **Off by default** — it only acts after a
-    /// check the user already opted into, and stays inert in unsigned dev builds
-    /// where verification fails closed.
-    #[serde(default)]
-    pub auto_install_updates: bool,
-    /// True once the first-run "check for updates?" prompt has been answered
-    /// (either way), so it is never shown again. The prompt is how a
-    /// privacy-conscious default of `check_for_updates = false` still lets a
-    /// user opt in on first launch.
-    #[serde(default)]
-    pub update_prompt_seen: bool,
-    /// Whether OpenLogi shows a macOS menu-bar (status item) icon. `true`
-    /// (default) → it lives in the menu bar, dropping the Dock icon while no
-    /// window is open; `false` → it stays an ordinary Dock app with no status
-    /// item. macOS-only; ignored on other platforms.
-    #[serde(default = "default_true")]
-    pub show_in_menu_bar: bool,
-    /// Whether the GUI automatically downloads device images from
-    /// `assets.openlogi.org` when a device appears. `true` (default) keeps
-    /// the current behavior; `false` makes no asset network requests at all
-    /// (the app falls back to bundled art and the synthetic silhouette). A
-    /// manual "Refresh assets" in Settings still fetches on demand regardless.
-    #[serde(default = "default_true")]
-    pub auto_download_assets: bool,
-    /// UI language as a BCP-47-ish locale code matching the GUI's bundled
-    /// locales (e.g. `"en"`, `"de"`, `"pt-BR"`, `"zh-CN"`, `"zh-TW"`; see the
-    /// GUI's `i18n::SUPPORTED`). `None` means "follow the system locale", which
-    /// the GUI resolves at startup. Stored here so a user's explicit choice
-    /// survives restarts regardless of the OS setting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub language: Option<String>,
-    /// Thumb-wheel responsiveness, on a [`MIN_THUMBWHEEL_SENSITIVITY`]–
-    /// [`MAX_THUMBWHEEL_SENSITIVITY`] scale. It scales both the speed of the
-    /// wheel's continuous horizontal scroll and how few rotation increments a
-    /// custom wheel action needs to fire. [`DEFAULT_THUMBWHEEL_SENSITIVITY`]
-    /// (the out-of-the-box value) means 1× scroll speed; the wheel is only
-    /// diverted from native scrolling once this leaves the default.
-    #[serde(default = "default_thumbwheel_sensitivity")]
-    pub thumbwheel_sensitivity: i32,
-    /// Light/dark appearance preference. Defaults to following the OS.
-    #[serde(default)]
-    pub appearance: Appearance,
-    /// Name of the theme used in light mode (a [`crate`]-agnostic string
-    /// matching a gpui-component theme, e.g. `"OpenLogi Light"`). `None` uses
-    /// the OpenLogi brand light theme.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub theme_light: Option<String>,
-    /// Name of the theme used in dark mode. `None` uses the OpenLogi brand dark
-    /// theme.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub theme_dark: Option<String>,
-    /// Corner-radius override for the UI, in pixels (the Appearance page offers
-    /// `0` / `6` / `12`). `None` keeps each theme's own radius.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ui_radius: Option<u8>,
-}
-
-/// Out-of-the-box [`AppSettings::thumbwheel_sensitivity`]. At this value the
-/// wheel's horizontal scroll runs at 1× and the wheel is left to scroll
-/// natively (no HID++ diversion) unless a binding diverges from its default.
-pub const DEFAULT_THUMBWHEEL_SENSITIVITY: i32 = 14;
-/// Lowest selectable [`AppSettings::thumbwheel_sensitivity`].
-pub const MIN_THUMBWHEEL_SENSITIVITY: i32 = 1;
-/// Highest selectable [`AppSettings::thumbwheel_sensitivity`].
-pub const MAX_THUMBWHEEL_SENSITIVITY: i32 = 100;
-
-impl AppSettings {
-    /// `skip_serializing_if` helper: true when nothing diverges from the
-    /// default, so empty settings don't clutter `config.toml`.
-    #[must_use]
-    pub fn is_default(&self) -> bool {
-        self == &Self::default()
-    }
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            launch_at_login: false,
-            check_for_updates: false,
-            auto_install_updates: false,
-            update_prompt_seen: false,
-            show_in_menu_bar: true,
-            auto_download_assets: true,
-            language: None,
-            thumbwheel_sensitivity: DEFAULT_THUMBWHEEL_SENSITIVITY,
-            appearance: Appearance::System,
-            theme_light: None,
-            theme_dark: None,
-            ui_radius: None,
-        }
-    }
-}
-
-/// serde default for [`AppSettings::show_in_menu_bar`]: `true`, so the menu-bar
-/// icon is on out of the box and configs predating the field keep that behavior.
-fn default_true() -> bool {
-    true
-}
-
-/// serde default for [`AppSettings::thumbwheel_sensitivity`]: keeps configs
-/// predating the field at the 1× default.
-const fn default_thumbwheel_sensitivity() -> i32 {
-    DEFAULT_THUMBWHEEL_SENSITIVITY
-}
-
-/// Per-device RGB lighting: a single static color, brightness, and on/off.
-/// Deliberately basic — per-key effects are a later addition.
-///
-/// Crosses the agent↔GUI IPC (`set_lighting`), so field order is wire format —
-/// changes require a `PROTOCOL_VERSION` bump (guarded by
-/// `openlogi-agent-core/tests/wire_format.rs`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Lighting {
-    #[serde(default = "default_lighting_enabled")]
-    pub enabled: bool,
-    /// Static color as 6 hex digits `"RRGGBB"` (no leading `#`).
-    #[serde(default = "default_lighting_color")]
-    pub color: String,
-    /// Brightness percent, clamped to 0–100 on load.
-    #[serde(
-        default = "default_lighting_brightness",
-        deserialize_with = "deserialize_brightness"
-    )]
-    pub brightness: u8,
-}
-
-impl Default for Lighting {
-    fn default() -> Self {
-        Self {
-            enabled: default_lighting_enabled(),
-            color: default_lighting_color(),
-            brightness: default_lighting_brightness(),
-        }
-    }
-}
-
-fn default_lighting_enabled() -> bool {
-    true
-}
-
-fn default_lighting_color() -> String {
-    "ffffff".to_string()
-}
-
-fn default_lighting_brightness() -> u8 {
-    100
-}
-
-/// Clamp a deserialized brightness into the UI's `0..=100` range, so a
-/// hand-edited `config.toml` can't feed out-of-range values into the scaling
-/// math (which assumes `brightness <= 100`).
-fn deserialize_brightness<'de, D>(deserializer: D) -> Result<u8, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(u8::deserialize(deserializer)?.min(100))
-}
-
-/// Scroll-wheel mode for [`SmartShift`]: free-spin or ratchet (clicky).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WheelMode {
-    Free,
-    Ratchet,
-}
-
-/// Per-device SmartShift wheel configuration, persisted so the agent can
-/// re-apply it when the device reconnects: the values are written to device
-/// RAM and do not survive a power cycle (#189), despite earlier assumptions
-/// that the device kept them in NVM.
-///
-/// Config-file only — never crosses the IPC (the agent reads it from
-/// `config.toml` on reload), so it is free to evolve without a
-/// `PROTOCOL_VERSION` bump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SmartShift {
-    pub mode: WheelMode,
-    /// SmartShift auto-disengage threshold (`0x01`–`0xFE`, in 0.25 turn/s
-    /// steps), or `0xFF` for a permanently engaged ratchet.
-    pub auto_disengage: u8,
-    /// Tunable-torque force percentage (`1`–`100`), `0` when the device
-    /// doesn't support tunable torque.
-    pub tunable_torque: u8,
-}
-
-/// Which control owns a device's single gesture role.
-///
-/// Stored explicitly — rather than inferred from which button happens to carry a
-/// [`Binding::Gesture`] — so switching the gesture button never has to collapse
-/// a button's gesture map to encode the choice: every gesture-capable button
-/// keeps its full direction map, and only the owner is dispatched. Serialized as
-/// a bare string (`"Off"` or a [`ButtonId`] name) so it stays a TOML scalar.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GestureOwner {
-    /// Gestures are explicitly turned off for this device.
-    Off,
-    /// The named button owns the gesture role.
-    Button(ButtonId),
-}
-
-impl Serialize for GestureOwner {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            // "Off" can't collide with a ButtonId variant name (all CamelCase
-            // control names), so the string space is unambiguous.
-            GestureOwner::Off => serializer.serialize_str("Off"),
-            GestureOwner::Button(id) => id.serialize(serializer),
-        }
-    }
-}
-
-/// Lenient field deserializer for [`RawDeviceConfig::gesture_owner`]. An
-/// unrecognized or miscased value (`"back"`, a typo, a future-version button
-/// name) is treated as absent — i.e. "infer the owner" — rather than failing the
-/// whole-document parse and reverting *every* device's settings to defaults.
-/// Mirrors [`deserialize_brightness`], which clamps a bad value instead of
-/// erroring; a hand-editable config should degrade one field, not the document.
-fn deserialize_gesture_owner<'de, D>(deserializer: D) -> Result<Option<GestureOwner>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    if s == "Off" {
-        return Ok(Some(GestureOwner::Off));
-    }
-    // Parse the button name with a throwaway error type so an unknown token maps
-    // to `None` (infer) rather than propagating an error.
-    let button = ButtonId::deserialize(
-        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&s),
-    )
-    .ok();
-    Ok(button.map(GestureOwner::Button))
-}
-
-/// Last-known identity of a device, captured while it was online so the UI can
-/// render its card and the *correct* config panels before any live HID++ probe
-/// completes — or while the device is asleep and can't be probed at all.
-///
-/// Every field is a **static property of the model**, not of the current
-/// connection: an MX Master 3S has adjustable DPI whether or not it is awake.
-/// That is what makes this safe to persist — it never goes stale. It is also
-/// free of any per-unit identifier (no serial number, no unit id), so caching
-/// it adds no privacy surface beyond the `config_key` already used as the map
-/// key. Persisting identity is what stops a sleeping/just-booted mouse from
-/// vanishing from the device list (and losing its Pointer/Buttons panels)
-/// until a cold probe happens to win its race — see issue #159.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceIdentity {
-    /// The name shown in the carousel, as resolved from the asset registry the
-    /// last time the device was online.
-    pub display_name: String,
-    /// HID++ model identity from feature 0x0003, when available. Persisted so
-    /// the GUI can resolve the same curated asset while the device is asleep.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_info: Option<DeviceModelInfo>,
-    /// Firmware codename, when available. Used as an asset-resolution hint and
-    /// as a readable fallback for devices without curated model metadata.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codename: Option<String>,
-    /// The device's resolved [`DeviceKind`] (asset registry preferred, HID++
-    /// classification as fallback).
-    pub kind: DeviceKind,
-    /// Configuration capabilities measured from the device's HID++ feature
-    /// table. This is the field that keeps a sleeping mouse's panels visible.
-    pub capabilities: Capabilities,
-}
-
-/// Settings scoped to a single physical device.
-///
-/// Deserialization goes through `RawDeviceConfig` (`#[serde(from)]`) so
-/// pre-v2 files — which split bindings across `button_bindings` +
-/// `gesture_bindings` — fold into the unified [`Self::bindings`] map. Only
-/// `bindings` is ever serialized, so a migrated file self-heals to the v2 shape
-/// on its next save.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(from = "RawDeviceConfig")]
-pub struct DeviceConfig {
-    /// Which button owns the device's single gesture role, once the user has
-    /// chosen explicitly. Absent means "infer" (the dedicated HID++ gesture
-    /// button owns gestures if present) — see [`Config::gesture_owner`]. Listed
-    /// first so it serializes as a scalar ahead of the `bindings` sub-table.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gesture_owner: Option<GestureOwner>,
-    /// Last-known identity (name / kind / capabilities), captured while the
-    /// device was online. Lets the UI render this device — with the right
-    /// config panels — on a cold start before any probe, or while it sleeps.
-    /// `None` for configs written before this field existed or by hand.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<DeviceIdentity>,
-    /// Every rebindable button's binding: a single [`Action`], or — for the
-    /// gesture button (and, later, any raw-XY-capable button) — a
-    /// [`Binding::Gesture`] per-direction map.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub bindings: BTreeMap<ButtonId, Binding>,
-    /// Per-application binding overlays (P1.4). Keyed by bundle identifier
-    /// (e.g. `"com.microsoft.VSCode"` on macOS). When the foreground app's
-    /// id matches a key here, those bindings take precedence; anything not
-    /// listed falls through to `bindings`. Deliberately `Action`-valued (not
-    /// `Binding`): a per-app override replaces the whole button with one
-    /// action, never a per-direction gesture overlay.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub per_app_bindings: BTreeMap<String, BTreeMap<ButtonId, Action>>,
-    /// Ordered list of DPI presets cycled through by
-    /// [`Action::CycleDpiPresets`] and indexed by
-    /// [`Action::SetDpiPreset`]. Empty means "no presets configured" —
-    /// the cycle action becomes a no-op until the user adds at least one.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dpi_presets: Vec<u32>,
-    /// The sensor DPI the user committed for this device. Persisted because
-    /// the value lives in device RAM and resets on a power cycle (#189); the
-    /// agent re-applies it when the device reconnects. `None` until the user
-    /// first changes DPI.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dpi: Option<u32>,
-    /// Per-device RGB lighting (static color + brightness + on/off). `None`
-    /// until the user changes it, so it stays out of `config.toml` otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lighting: Option<Lighting>,
-    /// Per-device SmartShift wheel configuration, re-applied on reconnect for
-    /// the same reason as [`Self::dpi`]. `None` until the user changes it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub smartshift: Option<SmartShift>,
-    /// Invert this device's scroll-wheel direction relative to the OS setting
-    /// (issue #126): on, a wheel tick scrolls the opposite way, so a user who
-    /// keeps macOS "natural scrolling" for the trackpad can have a traditional
-    /// "reverse" wheel on the mouse. Vertical only; the agent applies it through
-    /// the device's HID++ native wheel-inversion mode when supported. `false`
-    /// (default) is the native direction, and is omitted from `config.toml`.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub invert_scroll: bool,
-}
-
-/// `skip_serializing_if` helper for plain `bool` fields whose default is
-/// `false`: keeps an unset toggle out of `config.toml` entirely.
-#[allow(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde's skip_serializing_if requires a fn(&T) -> bool signature"
-)]
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-/// Deserialize-only shim that folds the pre-v2 `button_bindings` +
-/// `gesture_bindings` fields into [`DeviceConfig::bindings`]. Never serialized
-/// (only [`DeviceConfig`] is), so reading a legacy file and saving rewrites it
-/// in the v2 shape.
-#[derive(Deserialize)]
-struct RawDeviceConfig {
-    /// Explicit gesture owner (v2.1+). Absent on older configs → `None` → the
-    /// owner is inferred in [`Config::gesture_owner`]. A present-but-invalid
-    /// value is tolerated as `None` (infer), not a parse error — see
-    /// [`deserialize_gesture_owner`].
-    #[serde(default, deserialize_with = "deserialize_gesture_owner")]
-    gesture_owner: Option<GestureOwner>,
-    #[serde(default)]
-    identity: Option<DeviceIdentity>,
-    /// v2 shape — present on already-migrated files; wins on any key collision.
-    #[serde(default)]
-    bindings: BTreeMap<ButtonId, Binding>,
-    /// Legacy v1 per-button single bindings.
-    #[serde(default)]
-    button_bindings: BTreeMap<ButtonId, Action>,
-    /// Legacy v1 flat gesture map (implicitly the gesture button's directions).
-    #[serde(default)]
-    gesture_bindings: BTreeMap<GestureDirection, Action>,
-    #[serde(default)]
-    per_app_bindings: BTreeMap<String, BTreeMap<ButtonId, Action>>,
-    #[serde(default)]
-    dpi_presets: Vec<u32>,
-    #[serde(default)]
-    dpi: Option<u32>,
-    #[serde(default)]
-    lighting: Option<Lighting>,
-    #[serde(default)]
-    smartshift: Option<SmartShift>,
-    #[serde(default)]
-    invert_scroll: bool,
-}
-
-impl From<RawDeviceConfig> for DeviceConfig {
-    fn from(raw: RawDeviceConfig) -> Self {
-        let mut bindings = raw.bindings; // the v2 map wins on every key.
-
-        // Re-home the legacy flat gesture map under `GestureButton`. This MUST
-        // happen before folding `button_bindings`, so a legacy single
-        // `button_bindings[GestureButton]` entry coexisting with a
-        // `gesture_bindings` map cannot claim the slot first and silently drop
-        // the whole direction map (the pre-v2 rule was "gesture entries win").
-        if !raw.gesture_bindings.is_empty() {
-            bindings
-                .entry(ButtonId::GestureButton)
-                .or_insert_with(|| Binding::Gesture(raw.gesture_bindings));
-        }
-        for (button, action) in raw.button_bindings {
-            // A legacy `button_bindings[GestureButton]` is vestigial and must not
-            // become a `Binding::Single`: the gesture button never dispatched
-            // through the per-button map (it is not an OS-hook button, and its
-            // plain press routes through the gesture `Click` slot — see
-            // agent-core `bindings_for`). A `Single` here would be unreachable —
-            // the GUI hides it and the runtime ignores it — while folding it into
-            // `Click` would resurrect a dead binding as a behavior change. Drop
-            // it: the gesture map (re-homed above) already owns this button, and
-            // an absent entry falls back to the canonical default, exactly as
-            // pre-v2.
-            if button == ButtonId::GestureButton {
-                continue;
-            }
-            bindings.entry(button).or_insert(Binding::Single(action));
-        }
-
-        DeviceConfig {
-            gesture_owner: raw.gesture_owner,
-            identity: raw.identity,
-            bindings,
-            per_app_bindings: raw.per_app_bindings,
-            dpi_presets: raw.dpi_presets,
-            dpi: raw.dpi,
-            lighting: raw.lighting,
-            smartshift: raw.smartshift,
-            invert_scroll: raw.invert_scroll,
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum ConfigError {
-    #[error("could not resolve config path")]
-    Path(#[from] PathsError),
-    #[error("could not read config at {path}")]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("could not parse config at {path}")]
-    Parse {
-        path: PathBuf,
-        #[source]
-        source: toml::de::Error,
-    },
-    #[error("could not write config at {path}")]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("could not serialize config")]
-    Serialize(#[from] toml::ser::Error),
-    #[error("config at {path} has unsupported schema_version {found}")]
-    UnsupportedSchemaVersion { path: PathBuf, found: u32 },
-}
-
-#[allow(
-    clippy::result_large_err,
-    reason = "Config I/O keeps rich parse/write context and is not a hot path"
-)]
 impl Config {
-    /// Loads the config from the default user path, returning
-    /// [`Config::default`] if the file does not exist yet.
-    pub fn load_or_default() -> Result<Self, ConfigError> {
-        Self::load_from_path(&paths::config_path()?)
-    }
-
-    /// Same as [`Self::load_or_default`] but reads from `path`. Used by tests
-    /// to avoid touching the real user config.
-    pub fn load_from_path(path: &Path) -> Result<Self, ConfigError> {
-        match fs::read_to_string(path) {
-            Ok(text) => {
-                let mut config: Self =
-                    toml::from_str(&text).map_err(|source| ConfigError::Parse {
-                        path: path.to_path_buf(),
-                        source,
-                    })?;
-                // Accept any version up to the current one: older files migrate
-                // through the per-device [`RawDeviceConfig`] shim and self-heal on
-                // the next save. Only a *newer* file is rejected — loudly, so a
-                // downgraded binary refuses to load (and silently wipe) a config
-                // it can't represent.
-                if config.schema_version > SCHEMA_VERSION {
-                    return Err(ConfigError::UnsupportedSchemaVersion {
-                        path: path.to_path_buf(),
-                        found: config.schema_version,
-                    });
-                }
-                // Stamp the in-memory doc to the current version so a re-save
-                // writes the migrated v2 shape (the device shim already folded
-                // the legacy fields during deserialize).
-                config.schema_version = SCHEMA_VERSION;
-                Ok(config)
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(source) => Err(ConfigError::Read {
-                path: path.to_path_buf(),
-                source,
-            }),
+    /// A config that never touches the on-disk file: [`Self::save_atomic`] is
+    /// a no-op. For tests that drive the state layer's persistence paths —
+    /// with a default config those would overwrite the developer's real
+    /// `config.toml` with test fixtures.
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        Self {
+            ephemeral: true,
+            ..Self::default()
         }
-    }
-
-    /// Writes the config atomically to the default user path: serialize to a
-    /// sibling temp file, then rename over the target. On Unix the temp file
-    /// is created with mode 0600.
-    pub fn save_atomic(&self) -> Result<(), ConfigError> {
-        self.save_to_path(&paths::config_path()?)
-    }
-
-    /// Same as [`Self::save_atomic`] but writes to `path`. Used by tests.
-    pub fn save_to_path(&self, path: &Path) -> Result<(), ConfigError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        }
-        let body = toml::to_string_pretty(self)?;
-        write_atomic(path, body.as_bytes()).map_err(|source| ConfigError::Write {
-            path: path.to_path_buf(),
-            source,
-        })
     }
 
     /// Returns the bindings stored for `device_key`, or an empty map if the
@@ -647,20 +185,25 @@ impl Config {
             .insert(button, binding);
     }
 
-    /// Returns the gesture sub-bindings for `device_key`'s gesture button, or an
-    /// empty map if it isn't in gesture mode. Derived from the unified
-    /// [`DeviceConfig::bindings`]; kept as a convenience for the agent-side
-    /// per-direction adapter.
-    #[must_use]
-    pub fn gesture_bindings_for(&self, device_key: &str) -> BTreeMap<GestureDirection, Action> {
-        match self
-            .devices
-            .get(device_key)
-            .and_then(|d| d.bindings.get(&ButtonId::GestureButton))
-        {
-            Some(Binding::Gesture(map)) => map.clone(),
-            _ => BTreeMap::new(),
+    /// Records (or, with `action = None`, clears) the F-key `trigger` binding
+    /// in the global `[keyboard]` map. Keyboard bindings are device-agnostic —
+    /// one map applies across all keyboards — so this mirrors [`Self::set_binding`]
+    /// minus the device key.
+    pub fn set_keyboard_binding(&mut self, trigger: KeyTrigger, action: Option<Action>) {
+        match action {
+            Some(a) => {
+                self.keyboard.bindings.insert(trigger, a);
+            }
+            None => {
+                self.keyboard.bindings.remove(&trigger);
+            }
         }
+    }
+
+    /// The global keyboard F-key bindings (read accessor).
+    #[must_use]
+    pub fn keyboard_bindings(&self) -> &BTreeMap<KeyTrigger, Action> {
+        &self.keyboard.bindings
     }
 
     /// Records `action` for one `direction` of `button`'s gesture binding,
@@ -689,7 +232,7 @@ impl Config {
     /// in place (its action kept as the [`GestureDirection::Click`]). Returns the
     /// entry so the caller can finish it — seed every direction
     /// ([`Binding::fill_gesture_defaults`]) or set just one. Shared by
-    /// [`Self::set_gesture_owner`] and [`Self::set_gesture_direction`] so the two
+    /// [`Self::set_gesture_mode`] and [`Self::set_gesture_direction`] so the two
     /// promote a button into gesture mode identically.
     fn ensure_gesture_binding(&mut self, device_key: &str, button: ButtonId) -> &mut Binding {
         let entry = self
@@ -703,31 +246,11 @@ impl Config {
         entry
     }
 
-    /// The button that owns `device_key`'s single gesture role, or `None` when
-    /// gestures are turned off.
-    ///
-    /// Resolved from the explicit [`DeviceConfig::gesture_owner`] when present;
-    /// otherwise inferred (see `Self::infer_gesture_owner`) for configs
-    /// predating the field and freshly-migrated pre-v2 files. The dedicated
-    /// HID++ gesture button ([`ButtonId::GestureButton`]) owns the role by
-    /// default. At most one button gestures per device.
-    #[must_use]
-    pub fn gesture_owner(&self, device_key: &str) -> Option<ButtonId> {
-        let Some(device) = self.devices.get(device_key) else {
-            // No config yet → the dedicated HID++ gesture button is the default gesture owner.
-            return Some(ButtonId::GestureButton);
-        };
-        match device.gesture_owner {
-            Some(GestureOwner::Off) => None,
-            Some(GestureOwner::Button(id)) => Some(id),
-            None => Self::infer_gesture_owner(&device.bindings),
-        }
-    }
-
-    /// Infer the gesture owner for a config predating the explicit
-    /// [`DeviceConfig::gesture_owner`] field, from the shape of `bindings` — the
-    /// pre-field behavior, so old/migrated configs keep working until the first
-    /// explicit owner change stamps the field.
+    /// The single button the pre-v4 owner-locked runtime would have dispatched
+    /// gestures from, inferred from the binding shapes — the owner-lock-era
+    /// resolution rule, retained solely for
+    /// [`Self::migrate_owner_locked_gestures`]. `None` means gestures were off.
+    #[cfg(feature = "fs")]
     fn infer_gesture_owner(bindings: &BTreeMap<ButtonId, Binding>) -> Option<ButtonId> {
         // An OS-hook button left in gesture mode took the role over.
         if let Some((id, _)) = bindings
@@ -736,10 +259,11 @@ impl Config {
         {
             return Some(*id);
         }
-        // A dedicated HID++ gesture button explicitly demoted to a single action means gestures off.
+        // A dedicated HID++ gesture button explicitly assigned non-gesture
+        // behavior means gestures were off.
         if matches!(
             bindings.get(&ButtonId::GestureButton),
-            Some(Binding::Single(_))
+            Some(Binding::Single(_) | Binding::LongPress(_))
         ) {
             return None;
         }
@@ -747,35 +271,318 @@ impl Config {
         Some(ButtonId::GestureButton)
     }
 
-    /// Make `button` the device's sole gesture button.
+    /// Whether `button` on `device_key` is in gesture mode — a per-button fact
+    /// read straight from the binding shape: a stored [`Binding::Gesture`], or
+    /// no stored binding on a button whose canonical default
+    /// ([`default_binding_for`]) is gesture-shaped (the dedicated HID++ gesture
+    /// button starts in gesture mode).
     ///
-    /// Records `button` as the explicit [`gesture_owner`](Self::gesture_owner), so
-    /// the one-gesture-button-per-device lock is a data-model fact rather than a
-    /// destructive demotion of the others — every other gesture-capable button
-    /// keeps its own gesture map intact, ready to restore if re-chosen, and is
-    /// simply not dispatched while it isn't the owner. `button` is given a full
-    /// [`Binding::Gesture`] map: a prior [`Binding::Single`] is kept as the
-    /// [`GestureDirection::Click`] action, any existing swipe arms are preserved,
-    /// and unbound directions are seeded from
-    /// [`default_gesture_binding`](crate::binding::default_gesture_binding) so every
-    /// gesture button exposes the same full five-direction set.
-    pub fn set_gesture_owner(&mut self, device_key: &str, button: ButtonId) {
+    /// Gesture mode is not exclusive: any number of buttons may gesture at
+    /// once, each with its own direction map. This replaces the former
+    /// one-gesture-button-per-device owner lock — see [`Self::set_gesture_mode`].
+    #[must_use]
+    pub fn is_gesture_mode(&self, device_key: &str, button: ButtonId) -> bool {
         self.devices
-            .entry(device_key.to_string())
-            .or_default()
-            .gesture_owner = Some(GestureOwner::Button(button));
-        self.ensure_gesture_binding(device_key, button)
-            .fill_gesture_defaults();
+            .get(device_key)
+            .and_then(|d| d.bindings.get(&button))
+            .map_or_else(
+                || default_binding_for(button).is_gesture(),
+                Binding::is_gesture,
+            )
     }
 
-    /// Turn gestures off for `device_key`, recording the explicit "off" choice.
-    /// Every button keeps its gesture map intact (nothing is destroyed), so
-    /// re-selecting a gesture owner later restores its directions exactly.
-    pub fn disable_gestures(&mut self, device_key: &str) {
-        self.devices
-            .entry(device_key.to_string())
-            .or_default()
-            .gesture_owner = Some(GestureOwner::Off);
+    /// Every button of `device_key` currently in gesture mode, in [`ButtonId`]
+    /// declaration order. Purely config-derived: callers cross it with the
+    /// device's actual controls (a model without the dedicated gesture button
+    /// simply never captures it).
+    #[must_use]
+    pub fn gesture_mode_buttons(&self, device_key: &str) -> Vec<ButtonId> {
+        ButtonId::ALL
+            .iter()
+            .copied()
+            .filter(|b| self.is_gesture_mode(device_key, *b))
+            .collect()
+    }
+
+    /// Turn gesture mode on or off for one button, independently of every
+    /// other button.
+    ///
+    /// On: restore the button's stashed map when one exists (see
+    /// [`DeviceConfig::disabled_gestures`]) — an off/on round trip hands back
+    /// the user's customized arms exactly. Otherwise promote the stored
+    /// binding in place ([`Binding::upgrade_to_gesture`] keeps a prior single
+    /// action as the [`GestureDirection::Click`] entry) and seed unbound
+    /// directions from [`default_gesture_binding`].
+    ///
+    /// Off: stash the live map, then demote to a [`Binding::Single`] of the
+    /// map's `Click` action, falling back to the button's canonical
+    /// [`default_binding`] when the map has no explicit `Click` — a demoted
+    /// button always keeps a meaningful press. A button gesturing only by
+    /// default (no stored binding) stashes its seeded default map and is
+    /// pinned off with an explicit `Single` at its canonical default, which
+    /// the capture layer leaves native.
+    pub fn set_gesture_mode(&mut self, device_key: &str, button: ButtonId, enabled: bool) {
+        if enabled {
+            let device = self.devices.entry(device_key.to_string()).or_default();
+            if let Some(map) = device.disabled_gestures.remove(&button) {
+                device.bindings.insert(button, Binding::Gesture(map));
+            } else {
+                self.ensure_gesture_binding(device_key, button)
+                    .fill_gesture_defaults();
+            }
+            return;
+        }
+        let device = self.devices.entry(device_key.to_string()).or_default();
+        match device.bindings.get_mut(&button) {
+            Some(binding) => {
+                if let Binding::Gesture(map) = binding {
+                    device.disabled_gestures.insert(button, map.clone());
+                }
+                binding.demote_to_single(default_binding(button));
+            }
+            None => {
+                if default_binding_for(button).is_gesture() {
+                    device.disabled_gestures.insert(
+                        button,
+                        GestureDirection::ALL
+                            .iter()
+                            .copied()
+                            .map(|d| (d, default_gesture_binding(d)))
+                            .collect(),
+                    );
+                    device
+                        .bindings
+                        .insert(button, Binding::Single(default_binding(button)));
+                }
+            }
+        }
+    }
+
+    /// One-time load migration for owner-locked files (`schema_version <= 3`).
+    ///
+    /// Under the owner lock at most one button dispatched gestures; every other
+    /// gesture-capable button could keep a dormant direction map awaiting
+    /// re-selection, with [`DeviceConfig::gesture_owner`] recording the choice
+    /// (absent = infer). The shape-driven model has no dormant state — a stored
+    /// [`Binding::Gesture`] IS gesture mode — so this resolves the old owner
+    /// and rewrites the shapes to dispatch exactly what the old config did:
+    ///
+    /// - the owner keeps its gesture map. A HID++ owner whose stored binding
+    ///   is absent or `Single`-shaped gets the seeded default direction map
+    ///   materialized: the v3 runtime seeded at projection time and dispatched
+    ///   that map regardless of the stored shape, so leaving the shape
+    ///   non-gesture would silently lose gestures in the rewritten file. (An
+    ///   OS-hook owner is different — the v3 hook only dispatched a stored
+    ///   gesture map, so a `Single` owner stays single.)
+    /// - every other gesture-shaped binding is stashed into
+    ///   [`DeviceConfig::disabled_gestures`] — keeping the owner-lock model's
+    ///   restore-on-reselection promise — and demotes to a [`Binding::Single`]
+    ///   of its `Click`, the only part of a dormant map the old runtime
+    ///   dispatched;
+    /// - a non-owner dedicated gesture button with no stored binding is pinned
+    ///   with an explicit `Single` at its canonical default (absence would
+    ///   re-enter gesture mode under the gesture-shaped default), which the
+    ///   capture layer leaves native;
+    /// - the consumed `gesture_owner` never serializes again — the shape is
+    ///   the whole truth from here on.
+    #[cfg(feature = "fs")]
+    fn migrate_owner_locked_gestures(&mut self) {
+        for device in self.devices.values_mut() {
+            let owner = match device.gesture_owner.take() {
+                Some(GestureOwner::Off) => None,
+                Some(GestureOwner::Button(id)) => Some(id),
+                None => Self::infer_gesture_owner(&device.bindings),
+            };
+            for (id, binding) in &mut device.bindings {
+                if Some(*id) != owner {
+                    if let Binding::Gesture(map) = binding {
+                        device.disabled_gestures.insert(*id, map.clone());
+                    }
+                    binding.demote_to_single(default_binding(*id));
+                }
+            }
+            if let Some(owner) = owner
+                && owner.is_hidpp_gesture_source()
+            {
+                let seeded = || {
+                    Binding::Gesture(
+                        GestureDirection::ALL
+                            .iter()
+                            .copied()
+                            .map(|d| (d, default_gesture_binding(d)))
+                            .collect(),
+                    )
+                };
+                match device.bindings.get_mut(&owner) {
+                    // A stored non-gesture shape is replaced by the map v3
+                    // actually dispatched.
+                    Some(binding) if !binding.is_gesture() => *binding = seeded(),
+                    Some(_) => {}
+                    // An absent owner only needs materializing when its
+                    // canonical default is not gesture-shaped (the haptic
+                    // panel); an absent dedicated button already means
+                    // default gesture mode.
+                    None => {
+                        if !default_binding_for(owner).is_gesture() {
+                            device.bindings.insert(owner, seeded());
+                        }
+                    }
+                }
+            }
+            if owner != Some(ButtonId::GestureButton) {
+                device
+                    .bindings
+                    .entry(ButtonId::GestureButton)
+                    .or_insert_with(|| Binding::Single(default_binding(ButtonId::GestureButton)));
+            }
+        }
+    }
+
+    /// Rewrite v4 transport-scoped direct keys to identity keys.
+    ///
+    /// `direct:046d:c08d:unit:6be9d300` names one mouse *and the cable it was
+    /// plugged into*; `unit:6be9d300` names the mouse. The route it came from
+    /// is kept as a link so the index survives the rename. Receiver keys are
+    /// left alone — nothing on disk says which device is in a pairing slot, so
+    /// they are folded at runtime instead (see `adopt_route`).
+    ///
+    /// A `direct:` key can appear three ways: as a device's own map key, as
+    /// `selected_device`, or inside another device's `host_switch_targets` —
+    /// and the last of those can name a device with no `[devices.…]` table of
+    /// its own (nothing but the reference survives). The rename is computed
+    /// once over every occurrence so all three are rewritten consistently,
+    /// not just the ones that also own a device entry.
+    ///
+    /// Two entries can rename onto the same key — one mouse reached over both
+    /// USB and Bluetooth-direct has a v4 entry per route — so the second one
+    /// is folded in rather than inserted over the first. That is the one case
+    /// where this pass would otherwise not be lossless.
+    pub fn migrate_transport_scoped_keys(&mut self) {
+        // A v4 direct key is `direct:<vid>:<pid>:<identity-kind>:<identity>`.
+        // Splitting off the two leading id fields recovers the route to keep
+        // and the identity fragment that becomes the new key.
+        let parse_rename = |key: &str| -> Option<(String, String)> {
+            let rest = key.strip_prefix("direct:")?;
+            let mut parts = rest.splitn(3, ':');
+            let vendor = parts.next()?;
+            let product = parts.next()?;
+            let identity = parts.next()?;
+            PhysicalDeviceKey::parse(identity)?;
+            Some((identity.to_string(), format!("direct:{vendor}:{product}")))
+        };
+
+        let renames: BTreeMap<String, (String, String)> = self
+            .devices
+            .keys()
+            .cloned()
+            .chain(self.selected_device.iter().cloned())
+            .chain(
+                self.devices
+                    .values()
+                    .flat_map(|device| device.host_switch_targets.iter().cloned()),
+            )
+            .filter_map(|key| {
+                let renamed = parse_rename(&key)?;
+                Some((key, renamed))
+            })
+            .collect();
+
+        for (old, (new, route)) in &renames {
+            let Some(mut device) = self.devices.remove(old) else {
+                continue;
+            };
+            device.links.entry(route.clone()).or_default();
+            // One device reached on two direct routes — an MX Master 3S over
+            // USB and over Bluetooth-direct — has two v4 entries that rename
+            // to the same identity key. Inserting would drop whichever lost
+            // the `BTreeMap` ordering, bindings and all; folding is what
+            // makes this phase lossless, and it is the same merge adoption
+            // performs at runtime, so the second entry's disagreements land
+            // as overrides on the route they were set for.
+            match self.devices.get_mut(new) {
+                Some(existing) => identity::fold(existing, device, route),
+                None => {
+                    self.devices.insert(new.clone(), device);
+                }
+            }
+        }
+        if let Some(new) = self
+            .selected_device
+            .as_deref()
+            .and_then(|old| renames.get(old))
+            .map(|(new, _)| new.clone())
+        {
+            self.selected_device = Some(new);
+        }
+        for device in self.devices.values_mut() {
+            for target in &mut device.host_switch_targets {
+                if let Some((new, _)) = renames.get(target) {
+                    *target = new.clone();
+                }
+            }
+        }
+    }
+
+    /// Preserve the native behavior of explicit pre-v7 thumb-wheel defaults.
+    ///
+    /// Before v7 the built-in pair was forward/up → right and backward/down →
+    /// left. Because that pair equaled the defaults, an explicit copy in either
+    /// a device or per-app profile kept the wheel native. v7 swaps the defaults
+    /// after normalising device polarity; leaving an old pair in place would
+    /// now request a real reversal. Rewrite only profiles whose effective pair
+    /// was exactly the old default. Mixed/custom pairs already had literal
+    /// diverted semantics and must remain untouched.
+    #[cfg(feature = "fs")]
+    fn migrate_thumbwheel_native_direction(&mut self) {
+        let old_up = Action::HorizontalScrollRight;
+        let old_down = Action::HorizontalScrollLeft;
+        let new_up = Action::HorizontalScrollLeft;
+        let new_down = Action::HorizontalScrollRight;
+        let is_old_default = |binding: Option<&Binding>, old: &Action| match binding {
+            None => true,
+            Some(Binding::Single(action)) => action == old,
+            Some(Binding::Gesture(_) | Binding::LongPress(_)) => false,
+        };
+
+        for device in self.devices.values_mut() {
+            let global_up_is_old =
+                is_old_default(device.bindings.get(&ButtonId::ThumbwheelScrollUp), &old_up);
+            let global_down_is_old = is_old_default(
+                device.bindings.get(&ButtonId::ThumbwheelScrollDown),
+                &old_down,
+            );
+
+            for overlay in device.per_app_bindings.values_mut() {
+                let overrides_direction = overlay.contains_key(&ButtonId::ThumbwheelScrollUp)
+                    || overlay.contains_key(&ButtonId::ThumbwheelScrollDown);
+                let effective_up_is_old = overlay
+                    .get(&ButtonId::ThumbwheelScrollUp)
+                    .map_or(global_up_is_old, |action| action == &old_up);
+                let effective_down_is_old = overlay
+                    .get(&ButtonId::ThumbwheelScrollDown)
+                    .map_or(global_down_is_old, |action| action == &old_down);
+                if overrides_direction && effective_up_is_old && effective_down_is_old {
+                    // Write the complete pair. This also handles a profile that
+                    // reached the old defaults by overriding one half of a
+                    // custom global pair and inheriting the other half.
+                    overlay.insert(ButtonId::ThumbwheelScrollUp, new_up.clone());
+                    overlay.insert(ButtonId::ThumbwheelScrollDown, new_down.clone());
+                }
+            }
+
+            if global_up_is_old && global_down_is_old {
+                if let Some(Binding::Single(action)) =
+                    device.bindings.get_mut(&ButtonId::ThumbwheelScrollUp)
+                {
+                    *action = new_up.clone();
+                }
+                if let Some(Binding::Single(action)) =
+                    device.bindings.get_mut(&ButtonId::ThumbwheelScrollDown)
+                {
+                    *action = new_down.clone();
+                }
+            }
+        }
     }
 
     /// Resolve the effective binding map for `device_key`, overlaying the
@@ -796,7 +603,7 @@ impl Config {
         };
         let mut out = device.bindings.clone();
         if let Some(bid) = bundle_id
-            && let Some(overlay) = device.per_app_bindings.get(bid)
+            && let Some(overlay) = app_overlay(&device.per_app_bindings, bid)
         {
             for (k, v) in overlay {
                 out.insert(*k, Binding::Single(v.clone()));
@@ -835,13 +642,108 @@ impl Config {
         }
     }
 
-    /// HID++ config key of the carousel-selected device, if any.
+    /// The overrides `device_key` stores for the application key `app`,
+    /// or `None` when it has no profile for it.
+    ///
+    /// Exact key, deliberately: this answers "what did the user author under
+    /// this key", which is what an editor needs to show and to clear. The
+    /// question [`Self::has_app_override`] answers — "will the app in front hit
+    /// a profile" — is the matcher's, and goes through the same `exe:` fallback
+    /// the matcher does. The two look interchangeable and are not.
+    #[must_use]
+    pub fn per_app_overrides(
+        &self,
+        device_key: &str,
+        app: &str,
+    ) -> Option<&BTreeMap<ButtonId, Action>> {
+        self.devices
+            .get(device_key)?
+            .per_app_bindings
+            .get(app)
+            .filter(|overrides| !overrides.is_empty())
+    }
+
+    /// Every application key `device_key` has a profile for, in key order.
+    pub fn app_profiles(&self, device_key: &str) -> impl Iterator<Item = &str> {
+        self.devices
+            .get(device_key)
+            .into_iter()
+            .flat_map(|device| device.per_app_bindings.keys().map(String::as_str))
+    }
+
+    /// Drop `device_key`'s whole profile for `app`. Nothing happens when there
+    /// is none.
+    pub fn remove_app_profile(&mut self, device_key: &str, app: &str) {
+        if let Some(device) = self.devices.get_mut(device_key) {
+            device.per_app_bindings.remove(app);
+        }
+    }
+
+    /// Actions Ring settings for `device_key`, falling back to defaults when
+    /// the device has no saved ring configuration.
+    #[must_use]
+    pub fn action_ring(&self, device_key: &str) -> ActionRingConfig {
+        self.devices
+            .get(device_key)
+            .map(|device| device.action_ring.clone())
+            .unwrap_or_default()
+    }
+
+    /// Enable or disable `device_key`'s Actions Ring.
+    pub fn set_action_ring_enabled(&mut self, device_key: &str, enabled: bool) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .action_ring
+            .enabled = enabled;
+    }
+
+    /// Enable or disable ring hover and activation haptics.
+    pub fn set_action_ring_haptics(&mut self, device_key: &str, enabled: bool) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .action_ring
+            .haptics = enabled;
+    }
+
+    /// Replace or clear one slot in the default Actions Ring layout.
+    pub fn set_action_ring_slot(
+        &mut self,
+        device_key: &str,
+        slot: ActionRingSlot,
+        action: Option<RingAction>,
+    ) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .action_ring
+            .default
+            .set_action(slot, action);
+    }
+
+    /// Set or restore the action-derived icon for one default ring slot.
+    pub fn set_action_ring_icon(
+        &mut self,
+        device_key: &str,
+        slot: ActionRingSlot,
+        icon: Option<ActionRingIcon>,
+    ) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .action_ring
+            .default
+            .set_icon(slot, icon);
+    }
+
+    /// HID++ config key of the active device, if any.
     #[must_use]
     pub fn selected_device(&self) -> Option<&str> {
         self.selected_device.as_deref()
     }
 
-    /// Update the carousel-selected device. Pass `None` to clear the
+    /// Update the active device. Pass `None` to clear the
     /// selection (e.g. when the previously-selected device disappears).
     pub fn set_selected_device(&mut self, key: Option<String>) {
         self.selected_device = key;
@@ -850,7 +752,7 @@ impl Config {
     /// The ordered DPI preset list for `device_key`, or an empty `Vec` if the
     /// device has none configured yet.
     #[must_use]
-    pub fn dpi_presets(&self, device_key: &str) -> Vec<u32> {
+    pub fn dpi_presets(&self, device_key: &str) -> Vec<Dpi> {
         self.devices
             .get(device_key)
             .map(|d| d.dpi_presets.clone())
@@ -860,7 +762,7 @@ impl Config {
     /// Replace the DPI preset list for `device_key`. Pass an empty `Vec` to
     /// clear (the device block is kept; the field is just omitted on save
     /// thanks to `skip_serializing_if`).
-    pub fn set_dpi_presets(&mut self, device_key: &str, presets: Vec<u32>) {
+    pub fn set_dpi_presets(&mut self, device_key: &str, presets: Vec<Dpi>) {
         self.devices
             .entry(device_key.to_string())
             .or_default()
@@ -883,7 +785,30 @@ impl Config {
         self.devices
             .entry(device_key.to_string())
             .or_default()
-            .identity = Some(identity);
+            .identity = Some(identity.without_unit_identifiers());
+    }
+
+    /// Drop everything recorded for `device_key` — identity, custom name, and
+    /// per-device settings. Returns whether an entry existed.
+    pub fn remove_device(&mut self, device_key: &str) -> bool {
+        self.devices.remove(device_key).is_some()
+    }
+
+    /// The user-assigned name for `device_key`, if one is configured.
+    #[must_use]
+    pub fn device_custom_name(&self, device_key: &str) -> Option<&str> {
+        self.devices
+            .get(device_key)
+            .and_then(|device| device.custom_name.as_deref())
+    }
+
+    /// Set the user-assigned name for `device_key`, or clear it to use the
+    /// hardware model name again.
+    pub fn set_device_custom_name(&mut self, device_key: &str, custom_name: Option<String>) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .custom_name = custom_name;
     }
 
     /// Whether `device_key` has a non-empty per-app binding overlay for the
@@ -893,9 +818,7 @@ impl Config {
     #[must_use]
     pub fn has_app_override(&self, device_key: &str, app: &str) -> bool {
         self.devices.get(device_key).is_some_and(|d| {
-            d.per_app_bindings
-                .get(app)
-                .is_some_and(|overlay| !overlay.is_empty())
+            app_overlay(&d.per_app_bindings, app).is_some_and(|overlay| !overlay.is_empty())
         })
     }
 
@@ -924,15 +847,90 @@ impl Config {
             .lighting = Some(lighting);
     }
 
+    /// The saved UVC image controls for `device_key`, or `None` if never set.
+    #[must_use]
+    pub fn camera_controls(&self, device_key: &str) -> Option<CameraControls> {
+        self.devices
+            .get(device_key)
+            .and_then(|d| d.camera_controls.clone())
+    }
+
+    /// Replace the saved UVC image controls for `device_key`.
+    pub fn set_camera_controls(&mut self, device_key: &str, controls: CameraControls) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .camera_controls = Some(controls);
+    }
+
+    /// The saved custom camera profiles for `device_key` (name → snapshot).
+    #[must_use]
+    pub fn camera_profiles(&self, device_key: &str) -> BTreeMap<String, CameraControls> {
+        self.devices
+            .get(device_key)
+            .map(|d| d.camera_profiles.clone())
+            .unwrap_or_default()
+    }
+
+    /// Save (or overwrite) a custom camera profile for `device_key`.
+    pub fn save_camera_profile(&mut self, device_key: &str, name: &str, snap: CameraControls) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .camera_profiles
+            .insert(name.to_string(), snap);
+    }
+
+    /// Delete a custom camera profile, clearing the active selection if it
+    /// named it. Unknown names are a no-op.
+    pub fn delete_camera_profile(&mut self, device_key: &str, name: &str) {
+        if let Some(device) = self.devices.get_mut(device_key) {
+            device.camera_profiles.remove(name);
+            if device.camera_profile.as_deref() == Some(name) {
+                device.camera_profile = None;
+            }
+        }
+    }
+
+    /// The last-applied camera profile name for `device_key`, if any.
+    #[must_use]
+    pub fn camera_active_profile(&self, device_key: &str) -> Option<String> {
+        self.devices
+            .get(device_key)
+            .and_then(|d| d.camera_profile.clone())
+    }
+
+    /// Record which camera profile `device_key` last applied.
+    pub fn set_camera_active_profile(&mut self, device_key: &str, name: Option<String>) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .camera_profile = name;
+    }
+
+    /// The standalone-light config for `device_key`, or `None` if unset.
+    #[must_use]
+    pub fn light(&self, device_key: &str) -> Option<LightSettings> {
+        self.devices.get(device_key).and_then(|d| d.light)
+    }
+
+    /// Replace the standalone-light config for `device_key`.
+    pub fn set_light(&mut self, device_key: &str, light: LightSettings) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .light = Some(light);
+    }
+
     /// The committed sensor DPI for `device_key`, or `None` if never set.
     #[must_use]
-    pub fn dpi(&self, device_key: &str) -> Option<u32> {
+    pub fn dpi(&self, device_key: &str) -> Option<Dpi> {
         self.devices.get(device_key).and_then(|d| d.dpi)
     }
 
     /// Record the committed sensor DPI for `device_key`, so the agent can
     /// re-apply it when the device reconnects (#189).
-    pub fn set_dpi(&mut self, device_key: &str, dpi: u32) {
+    pub fn set_dpi(&mut self, device_key: &str, dpi: Dpi) {
         self.devices.entry(device_key.to_string()).or_default().dpi = Some(dpi);
     }
 
@@ -940,6 +938,13 @@ impl Config {
     #[must_use]
     pub fn smartshift(&self, device_key: &str) -> Option<SmartShift> {
         self.devices.get(device_key).and_then(|d| d.smartshift)
+    }
+
+    /// The persisted keyboard Fn-lock state for `device_key`, or `None` when
+    /// the user never set one (the keyboard keeps its own state).
+    #[must_use]
+    pub fn fn_lock(&self, device_key: &str) -> Option<bool> {
+        self.devices.get(device_key).and_then(|d| d.fn_lock)
     }
 
     /// Record the SmartShift wheel config for `device_key`, so the agent can
@@ -968,751 +973,87 @@ impl Config {
             .or_default()
             .invert_scroll = invert;
     }
+
+    /// The configured wheel resolution for `device_key`, or `None` when
+    /// OpenLogi should leave the device's current resolution unchanged.
+    #[must_use]
+    pub fn scroll_resolution(&self, device_key: &str) -> Option<ScrollResolution> {
+        self.devices
+            .get(device_key)
+            .and_then(|device| device.scroll_resolution)
+    }
+
+    /// Set the wheel resolution OpenLogi should restore for `device_key`.
+    /// Passing `None` returns the device to its unmanaged default state.
+    pub fn set_scroll_resolution(
+        &mut self,
+        device_key: &str,
+        resolution: Option<ScrollResolution>,
+    ) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .scroll_resolution = resolution;
+    }
+
+    /// Whether OpenLogi manages `device_key` at all (capture + volatile
+    /// re-apply). Unconfigured devices are managed.
+    #[must_use]
+    pub fn device_enabled(&self, device_key: &str) -> bool {
+        self.devices.get(device_key).is_none_or(|d| d.enabled)
+    }
+
+    /// Enable or disable OpenLogi's management of `device_key`.
+    pub fn set_device_enabled(&mut self, device_key: &str, enabled: bool) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .enabled = enabled;
+    }
+
+    /// The effective thumb-wheel sensitivity for `device_key`: the device's
+    /// override when set, else the app-wide default.
+    #[must_use]
+    pub fn thumbwheel_sensitivity(&self, device_key: &str) -> ThumbwheelSensitivity {
+        self.devices
+            .get(device_key)
+            .and_then(|d| d.thumbwheel_sensitivity)
+            .unwrap_or(self.app_settings.thumbwheel_sensitivity)
+    }
+
+    /// Set (or clear, with `None`) `device_key`'s thumb-wheel sensitivity
+    /// override.
+    pub fn set_device_thumbwheel_sensitivity(
+        &mut self,
+        device_key: &str,
+        sensitivity: Option<ThumbwheelSensitivity>,
+    ) {
+        self.devices
+            .entry(device_key.to_string())
+            .or_default()
+            .thumbwheel_sensitivity = sensitivity;
+    }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("toml.tmp");
-    {
-        #[cfg(unix)]
+/// Resolve the most specific application overlay for a foreground identifier.
+///
+/// Exact keys retain precedence. On Windows the foreground identifier is a
+/// lower-cased executable path, so `exe:<filename>` provides a stable fallback
+/// for Store and self-updating applications whose install directory changes
+/// between versions. Recognizing both path separators keeps hand-authored
+/// Windows config inspectable on every platform without changing macOS bundle
+/// identifiers or Linux application classes.
+fn app_overlay<'a, T>(overlays: &'a BTreeMap<String, T>, app: &str) -> Option<&'a T> {
+    overlays.get(app).or_else(|| {
+        let executable_name = app.rsplit(['\\', '/']).next()?;
+        if executable_name.is_empty()
+            || !Path::new(executable_name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            io::Write::write_all(&mut f, bytes)?;
-            f.sync_all()?;
-        }
-        #[cfg(not(unix))]
-        {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)?;
-            io::Write::write_all(&mut f, bytes)?;
-            f.sync_all()?;
-        }
-    }
-    fs::rename(&tmp, path)
-}
-
-#[cfg(test)]
-#[allow(clippy::expect_used, reason = "expect/unwrap are idiomatic in tests")]
-mod tests {
-    use super::*;
-    use crate::binding::{default_binding, default_gesture_binding};
-
-    fn write_and_read(config: &Config) -> Config {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        config.save_to_path(&path).expect("save");
-        Config::load_from_path(&path).expect("load")
-    }
-
-    #[test]
-    fn missing_file_yields_default() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("nonexistent.toml");
-        let cfg = Config::load_from_path(&path).expect("load");
-        assert_eq!(cfg.schema_version, SCHEMA_VERSION);
-        assert!(cfg.devices.is_empty());
-    }
-
-    #[test]
-    fn lighting_roundtrips_per_device() {
-        let mut cfg = Config::default();
-        cfg.set_lighting(
-            "g513",
-            Lighting {
-                enabled: true,
-                color: "00aabb".to_string(),
-                brightness: 75,
-            },
-        );
-        let restored = write_and_read(&cfg);
-        assert_eq!(
-            restored.lighting("g513"),
-            Some(Lighting {
-                enabled: true,
-                color: "00aabb".to_string(),
-                brightness: 75,
-            })
-        );
-        assert_eq!(restored.lighting("absent"), None);
-    }
-
-    #[test]
-    fn dpi_roundtrips_per_device() {
-        let mut cfg = Config::default();
-        cfg.set_dpi("2b042", 1600);
-        let restored = write_and_read(&cfg);
-        assert_eq!(restored.dpi("2b042"), Some(1600));
-        assert_eq!(restored.dpi("absent"), None);
-    }
-
-    #[test]
-    fn smartshift_roundtrips_per_device() {
-        let mut cfg = Config::default();
-        cfg.set_smartshift(
-            "2b042",
-            SmartShift {
-                mode: WheelMode::Ratchet,
-                auto_disengage: 16,
-                tunable_torque: 30,
-            },
-        );
-        let restored = write_and_read(&cfg);
-        assert_eq!(
-            restored.smartshift("2b042"),
-            Some(SmartShift {
-                mode: WheelMode::Ratchet,
-                auto_disengage: 16,
-                tunable_torque: 30,
-            })
-        );
-        assert_eq!(restored.smartshift("absent"), None);
-    }
-
-    #[test]
-    fn invert_scroll_roundtrips_per_device() {
-        let mut cfg = Config::default();
-        // Default is the native direction for any device, present or not.
-        assert!(!cfg.invert_scroll("2b042"));
-        cfg.set_invert_scroll("2b042", true);
-        let restored = write_and_read(&cfg);
-        assert!(restored.invert_scroll("2b042"));
-        assert!(!restored.invert_scroll("absent"));
-    }
-
-    #[test]
-    fn default_invert_scroll_is_omitted_from_toml() {
-        // A device block with only the default (false) invert_scroll must not
-        // emit the field — `skip_serializing_if` keeps configs clean.
-        let mut cfg = Config::default();
-        cfg.set_binding("2b042", ButtonId::Back, Binding::Single(Action::Copy));
-        cfg.set_invert_scroll("2b042", false);
-        let body = toml::to_string_pretty(&cfg).expect("serialize");
-        assert!(
-            !body.contains("invert_scroll"),
-            "default invert_scroll should be omitted: {body}"
-        );
-    }
-
-    #[test]
-    fn bindings_roundtrip_per_device() {
-        let mut cfg = Config::default();
-        cfg.set_binding("2b042", ButtonId::Back, Binding::Single(Action::Copy));
-        cfg.set_binding(
-            "2b042",
-            ButtonId::DpiToggle,
-            Binding::Single(Action::CustomShortcut(crate::binding::KeyCombo {
-                modifiers: crate::binding::KeyCombo::MOD_CMD,
-                key_code: 0x23, // kVK_ANSI_P
-                display: "⌘P".into(),
-            })),
-        );
-        cfg.set_binding("4082d", ButtonId::Back, Binding::Single(Action::Paste));
-
-        let parsed = write_and_read(&cfg);
-
-        // Per-device isolation.
-        let a = parsed.bindings_for("2b042");
-        assert_eq!(a.get(&ButtonId::Back), Some(&Binding::Single(Action::Copy)));
-        assert_eq!(
-            a.get(&ButtonId::DpiToggle),
-            Some(&Binding::Single(Action::CustomShortcut(
-                crate::binding::KeyCombo {
-                    modifiers: crate::binding::KeyCombo::MOD_CMD,
-                    key_code: 0x23,
-                    display: "⌘P".into(),
-                }
-            )))
-        );
-
-        let b = parsed.bindings_for("4082d");
-        assert_eq!(
-            b.get(&ButtonId::Back),
-            Some(&Binding::Single(Action::Paste))
-        );
-        assert_eq!(b.len(), 1, "device b should only see its own bindings");
-
-        // Unknown device returns empty map without panic.
-        assert!(parsed.bindings_for("deadbeef").is_empty());
-    }
-
-    #[test]
-    fn human_readable_toml_layout() {
-        let mut cfg = Config::default();
-        cfg.set_binding(
-            "2b042",
-            ButtonId::Back,
-            Binding::Single(Action::BrowserBack),
-        );
-        let body = toml::to_string_pretty(&cfg).expect("serialize");
-
-        // The key only contains [A-Za-z0-9_], so TOML emits it as a bare-word
-        // table key (no surrounding quotes). The test asserts the observable
-        // structure rather than locking in a specific quoting.
-        assert!(body.contains("schema_version = 3"), "got: {body}");
-        assert!(body.contains("[devices.2b042.bindings]"), "got: {body}");
-        // A `Single` binding serializes byte-identically to the pre-v2 bare
-        // `Action`, so the leaf line is unchanged.
-        assert!(body.contains("Back = \"BrowserBack\""), "got: {body}");
-    }
-
-    #[test]
-    fn dpi_presets_roundtrip_per_device() {
-        let mut cfg = Config::default();
-        cfg.set_dpi_presets("2b042", vec![800, 1600, 3200]);
-        cfg.set_dpi_presets("4082d", vec![400, 1600]);
-
-        let parsed = write_and_read(&cfg);
-
-        assert_eq!(parsed.dpi_presets("2b042"), vec![800, 1600, 3200]);
-        assert_eq!(parsed.dpi_presets("4082d"), vec![400, 1600]);
-        assert!(parsed.dpi_presets("unknown").is_empty());
-    }
-
-    #[test]
-    fn empty_dpi_presets_skip_serialization() {
-        let mut cfg = Config::default();
-        // Add a binding so the device block exists.
-        cfg.set_binding("2b042", ButtonId::Back, Binding::Single(Action::Copy));
-        cfg.set_dpi_presets("2b042", vec![800]);
-        cfg.set_dpi_presets("2b042", vec![]); // clear
-
-        let body = toml::to_string_pretty(&cfg).expect("serialize");
-        assert!(
-            !body.contains("dpi_presets"),
-            "empty dpi_presets should be omitted: {body}"
-        );
-    }
-
-    #[test]
-    fn device_identity_roundtrips_and_is_iterable() {
-        use crate::device::{Capabilities, DeviceKind};
-
-        let mut cfg = Config::default();
-        let mouse = DeviceIdentity {
-            display_name: "MX Master 3S".to_string(),
-            model_info: None,
-            codename: None,
-            kind: DeviceKind::Mouse,
-            capabilities: Capabilities {
-                buttons: true,
-                pointer: true,
-                lighting: false,
-                scroll_inversion: false,
-            },
-        };
-        cfg.set_device_identity("2b034", mouse.clone());
-        // Recording an identity must not disturb unrelated per-device state.
-        cfg.set_binding(
-            "2b034",
-            ButtonId::Back,
-            Binding::Single(Action::BrowserBack),
-        );
-
-        let parsed = write_and_read(&cfg);
-        assert_eq!(parsed.device_identity("2b034"), Some(&mouse));
-        assert_eq!(parsed.device_identity("absent"), None);
-        assert_eq!(
-            parsed.bindings_for("2b034").get(&ButtonId::Back),
-            Some(&Binding::Single(Action::BrowserBack)),
-            "identity must coexist with bindings on the same device block"
-        );
-        assert_eq!(
-            parsed.known_identities().collect::<Vec<_>>(),
-            vec![("2b034", &mouse)]
-        );
-    }
-
-    #[test]
-    fn selected_device_roundtrips() {
-        let mut cfg = Config::default();
-        assert_eq!(cfg.selected_device(), None);
-        cfg.set_selected_device(Some("2b042".into()));
-        let parsed = write_and_read(&cfg);
-        assert_eq!(parsed.selected_device(), Some("2b042"));
-    }
-
-    #[test]
-    fn per_app_overlay_takes_precedence() {
-        let mut cfg = Config::default();
-        cfg.set_binding(
-            "2b042",
-            ButtonId::Back,
-            Binding::Single(Action::BrowserBack),
-        );
-        cfg.set_binding(
-            "2b042",
-            ButtonId::Forward,
-            Binding::Single(Action::BrowserForward),
-        );
-        cfg.set_per_app_binding(
-            "2b042",
-            "com.microsoft.VSCode",
-            ButtonId::Back,
-            Some(Action::Undo),
-        );
-
-        // Global: both buttons are browser nav.
-        let global = cfg.effective_bindings("2b042", None);
-        assert_eq!(
-            global.get(&ButtonId::Back),
-            Some(&Binding::Single(Action::BrowserBack))
-        );
-        assert_eq!(
-            global.get(&ButtonId::Forward),
-            Some(&Binding::Single(Action::BrowserForward))
-        );
-
-        // VSCode: Back overridden (wrapped as Single), Forward inherits.
-        let vscode = cfg.effective_bindings("2b042", Some("com.microsoft.VSCode"));
-        assert_eq!(
-            vscode.get(&ButtonId::Back),
-            Some(&Binding::Single(Action::Undo))
-        );
-        assert_eq!(
-            vscode.get(&ButtonId::Forward),
-            Some(&Binding::Single(Action::BrowserForward))
-        );
-
-        // Unrelated app falls through.
-        let other = cfg.effective_bindings("2b042", Some("com.apple.Safari"));
-        assert_eq!(
-            other.get(&ButtonId::Back),
-            Some(&Binding::Single(Action::BrowserBack))
-        );
-    }
-
-    #[test]
-    fn per_app_binding_removal_prunes_empty_app() {
-        let mut cfg = Config::default();
-        cfg.set_per_app_binding(
-            "2b042",
-            "com.example.App",
-            ButtonId::Back,
-            Some(Action::Copy),
-        );
-        cfg.set_per_app_binding("2b042", "com.example.App", ButtonId::Back, None);
-        assert!(
-            cfg.devices["2b042"].per_app_bindings.is_empty(),
-            "removing last override should prune the app entry"
-        );
-    }
-
-    #[test]
-    fn app_settings_default_omits_block() {
-        let cfg = Config::default();
-        let body = toml::to_string_pretty(&cfg).expect("serialize");
-        assert!(
-            !body.contains("app_settings"),
-            "default app_settings should be omitted: {body}"
-        );
-    }
-
-    #[test]
-    fn app_settings_launch_at_login_roundtrips() {
-        let mut cfg = Config::default();
-        cfg.app_settings.launch_at_login = true;
-        let parsed = write_and_read(&cfg);
-        assert!(parsed.app_settings.launch_at_login);
-    }
-
-    #[test]
-    fn cleared_selected_device_omits_field() {
-        let mut cfg = Config::default();
-        cfg.set_selected_device(Some("2b042".into()));
-        cfg.set_selected_device(None);
-        let body = toml::to_string_pretty(&cfg).expect("serialize");
-        assert!(
-            !body.contains("selected_device"),
-            "cleared selection should not appear: {body}"
-        );
-    }
-
-    #[test]
-    fn empty_device_block_is_skipped_in_output() {
-        // Inserting then clearing should not leave a [devices."x"] header
-        // with no bindings under it (skip_serializing_if on bindings).
-        let mut cfg = Config::default();
-        cfg.set_binding("2b042", ButtonId::Back, Binding::Single(Action::Copy));
-        cfg.devices
-            .get_mut("2b042")
-            .expect("entry")
-            .bindings
-            .clear();
-        let body = toml::to_string_pretty(&cfg).expect("serialize");
-        assert!(
-            !body.contains("Back"),
-            "cleared bindings should not appear: {body}"
-        );
-    }
-
-    #[test]
-    fn migrates_v1_button_and_gesture_bindings() {
-        // A pre-v2 file: split button_bindings + a flat gesture_bindings map.
-        let v1 = "\
-schema_version = 1
-
-[devices.2b042.button_bindings]
-Back = \"BrowserBack\"
-
-[devices.2b042.gesture_bindings]
-Up = \"Copy\"
-Click = \"Paste\"
-";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        fs::write(&path, v1).expect("write");
-
-        // v1 still loads (version <= current) and folds into the merged map.
-        let cfg = Config::load_from_path(&path).expect("load v1");
-        let bindings = cfg.bindings_for("2b042");
-        assert_eq!(
-            bindings.get(&ButtonId::Back),
-            Some(&Binding::Single(Action::BrowserBack))
-        );
-        let mut gesture = BTreeMap::new();
-        gesture.insert(GestureDirection::Up, Action::Copy);
-        gesture.insert(GestureDirection::Click, Action::Paste);
-        assert_eq!(
-            bindings.get(&ButtonId::GestureButton),
-            Some(&Binding::Gesture(gesture))
-        );
-
-        // Saving self-heals to the current shape: stamped version + merged table,
-        // legacy field names gone.
-        let body = toml::to_string_pretty(&cfg).expect("serialize");
-        assert!(body.contains("schema_version = 3"), "got: {body}");
-        assert!(body.contains("[devices.2b042.bindings]"), "got: {body}");
-        assert!(!body.contains("button_bindings"), "got: {body}");
-        assert!(!body.contains("gesture_bindings"), "got: {body}");
-    }
-
-    #[test]
-    fn migration_gesture_map_wins_over_legacy_single_gesture_button_entry() {
-        // The data-loss guard: when a legacy single button_bindings[GestureButton]
-        // entry coexists with a gesture_bindings map (reachable via hand-edited
-        // or very old configs), the gesture map must survive — not be shadowed by
-        // the single entry. Mirrors the pre-v2 "gesture entries win" rule.
-        let v1 = "\
-schema_version = 1
-
-[devices.2b042.button_bindings]
-GestureButton = \"MissionControl\"
-
-[devices.2b042.gesture_bindings]
-Up = \"Copy\"
-Down = \"Paste\"
-";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        fs::write(&path, v1).expect("write");
-
-        let cfg = Config::load_from_path(&path).expect("load v1");
-        let mut gesture = BTreeMap::new();
-        gesture.insert(GestureDirection::Up, Action::Copy);
-        gesture.insert(GestureDirection::Down, Action::Paste);
-        assert_eq!(
-            cfg.bindings_for("2b042").get(&ButtonId::GestureButton),
-            Some(&Binding::Gesture(gesture)),
-            "gesture map must win over the legacy single GestureButton entry"
-        );
-    }
-
-    #[test]
-    fn migration_drops_vestigial_lone_gesture_button_single() {
-        // A v1 file with only `button_bindings[GestureButton]` and no
-        // `gesture_bindings` (the pre-gesture-picker shape). That entry never
-        // dispatched in v1 — the gesture button's plain press routes through the
-        // gesture `Click` slot, not the per-button map — so migrating it to a
-        // `Binding::Single` would leave an unreachable entry the GUI hides and the
-        // runtime ignores. It must be dropped, not shadow the gesture path.
-        let v1 = "\
-schema_version = 1
-
-[devices.2b042.button_bindings]
-GestureButton = \"MissionControl\"
-Back = \"BrowserBack\"
-";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        fs::write(&path, v1).expect("write");
-
-        let bindings = Config::load_from_path(&path)
-            .expect("load v1")
-            .bindings_for("2b042");
-        // An ordinary button still migrates to a `Single`...
-        assert_eq!(
-            bindings.get(&ButtonId::Back),
-            Some(&Binding::Single(Action::BrowserBack))
-        );
-        // ...but the vestigial gesture-button single is gone, leaving the button
-        // to fall back to its canonical default rather than an unreachable entry.
-        assert_eq!(bindings.get(&ButtonId::GestureButton), None);
-    }
-
-    #[test]
-    fn rejects_newer_schema_version_but_accepts_v1() {
-        // A future version is rejected loudly; the current and older versions
-        // load (older ones migrate through the shim).
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "schema_version = 99\n").expect("write");
-        assert!(matches!(
-            Config::load_from_path(&path).expect_err("v99 should fail"),
-            ConfigError::UnsupportedSchemaVersion { found: 99, .. }
-        ));
-
-        fs::write(&path, "schema_version = 1\n").expect("write");
-        assert!(
-            Config::load_from_path(&path).is_ok(),
-            "v1 should still load"
-        );
-    }
-
-    #[test]
-    fn set_gesture_direction_upgrades_single_to_gesture() {
-        let mut cfg = Config::default();
-        // Start from a Single binding, then bind a swipe direction.
-        cfg.set_binding(
-            "2b042",
-            ButtonId::Back,
-            Binding::Single(Action::BrowserBack),
-        );
-        cfg.set_gesture_direction("2b042", ButtonId::Back, GestureDirection::Up, Action::Copy);
-
-        match cfg.bindings_for("2b042").get(&ButtonId::Back) {
-            Some(Binding::Gesture(map)) => {
-                // The prior single action is preserved as the Click entry.
-                assert_eq!(
-                    map.get(&GestureDirection::Click),
-                    Some(&Action::BrowserBack)
-                );
-                assert_eq!(map.get(&GestureDirection::Up), Some(&Action::Copy));
-            }
-            other => panic!("expected Gesture after upgrade, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn set_gesture_direction_on_fresh_gesture_button_seeds_click() {
-        // Binding one direction on a never-configured gesture button must still
-        // persist a `Click`, so the click projection is the canonical default
-        // rather than `Action::None` (which reads as a no-op press).
-        let mut cfg = Config::default();
-        cfg.set_gesture_direction(
-            "2b042",
-            ButtonId::GestureButton,
-            GestureDirection::Up,
-            Action::Copy,
-        );
-
-        match cfg.bindings_for("2b042").get(&ButtonId::GestureButton) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(map.get(&GestureDirection::Up), Some(&Action::Copy));
-                assert_eq!(
-                    map.get(&GestureDirection::Click),
-                    Some(&crate::binding::default_gesture_binding(
-                        GestureDirection::Click
-                    )),
-                    "a fresh gesture button must seed a Click from its default"
-                );
-            }
-            other => panic!("expected Gesture, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gesture_owner_defaults_to_hidpp_button_yields_to_oshook_and_can_be_off() {
-        let mut cfg = Config::default();
-        // Default: the dedicated HID++ gesture button owns the gesture role even with no config.
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
-
-        // A dedicated HID++ gesture binding keeps it the owner.
-        cfg.set_gesture_direction(
-            "2b042",
-            ButtonId::GestureButton,
-            GestureDirection::Up,
-            Action::MissionControl,
-        );
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
-
-        // An explicit OS-hook gesture button takes the role over.
-        cfg.set_binding(
-            "2b042",
-            ButtonId::Forward,
-            Binding::Gesture(BTreeMap::from([(GestureDirection::Up, Action::Copy)])),
-        );
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::Forward));
-
-        // Turning gestures off explicitly yields `None` (not the HID++ button default).
-        let mut off = Config::default();
-        off.disable_gestures("2b042");
-        assert_eq!(off.gesture_owner("2b042"), None);
-    }
-
-    #[test]
-    fn set_gesture_owner_records_owner_without_destroying_other_maps() {
-        let mut cfg = Config::default();
-        // Customize the dedicated HID++ gesture button's Up swipe; it is the (inferred) owner.
-        cfg.set_gesture_direction(
-            "2b042",
-            ButtonId::GestureButton,
-            GestureDirection::Up,
-            Action::Copy,
-        );
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
-
-        // Promote Back: the owner becomes Back explicitly; the HID++ gesture button keeps
-        // its full gesture map (no destructive demotion).
-        cfg.set_binding("2b042", ButtonId::Back, Action::BrowserBack.into());
-        cfg.set_gesture_owner("2b042", ButtonId::Back);
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::Back));
-
-        let bindings = cfg.bindings_for("2b042");
-        // Back is a full five-direction gesture button: its prior single action
-        // stays as Click, and the swipe arms are seeded from defaults.
-        match bindings.get(&ButtonId::Back) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(
-                    map.get(&GestureDirection::Click),
-                    Some(&Action::BrowserBack)
-                );
-                assert_eq!(
-                    map.get(&GestureDirection::Up),
-                    Some(&default_gesture_binding(GestureDirection::Up)),
-                    "a promoted button gets full default arms"
-                );
-            }
-            other => panic!("expected Back to be a gesture binding, got {other:?}"),
-        }
-        // The HID++ gesture button's customized map survived the switch intact.
-        match bindings.get(&ButtonId::GestureButton) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(map.get(&GestureDirection::Up), Some(&Action::Copy));
-            }
-            other => panic!("expected the HID++ gesture button map preserved, got {other:?}"),
+            return None;
         }
 
-        // Switching back restores the user's customization, not defaults
-        // (regression guard: owner-switch used to discard the swipe arms).
-        cfg.set_gesture_owner("2b042", ButtonId::GestureButton);
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
-        match cfg.bindings_for("2b042").get(&ButtonId::GestureButton) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(map.get(&GestureDirection::Up), Some(&Action::Copy));
-            }
-            other => panic!("expected preserved gesture map, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn set_gesture_owner_seeds_a_fresh_button_with_full_directions() {
-        let mut cfg = Config::default();
-        // The dedicated HID++ gesture button gets the full default direction map.
-        cfg.set_gesture_owner("2b042", ButtonId::GestureButton);
-        match cfg.bindings_for("2b042").get(&ButtonId::GestureButton) {
-            Some(Binding::Gesture(map)) => {
-                for dir in GestureDirection::ALL {
-                    assert_eq!(map.get(&dir), Some(&default_gesture_binding(dir)));
-                }
-            }
-            other => panic!("expected full default gesture map, got {other:?}"),
-        }
-
-        // A fresh OS-hook button also gets all five directions, not just a Click:
-        // its native action stays as Click, and the swipe arms are defaults — so
-        // the GUI's shown defaults are exactly what the runtime dispatches.
-        cfg.set_gesture_owner("2b042", ButtonId::Forward);
-        match cfg.bindings_for("2b042").get(&ButtonId::Forward) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(
-                    map.get(&GestureDirection::Click),
-                    Some(&default_binding(ButtonId::Forward))
-                );
-                for dir in [
-                    GestureDirection::Up,
-                    GestureDirection::Down,
-                    GestureDirection::Left,
-                    GestureDirection::Right,
-                ] {
-                    assert_eq!(map.get(&dir), Some(&default_gesture_binding(dir)));
-                }
-            }
-            other => panic!("expected full gesture map for Forward, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn disable_gestures_turns_off_without_destroying_maps() {
-        let mut cfg = Config::default();
-        cfg.set_gesture_direction(
-            "2b042",
-            ButtonId::GestureButton,
-            GestureDirection::Up,
-            Action::Copy,
-        );
-        cfg.disable_gestures("2b042");
-        // Off, but the HID++ gesture button's customized map is preserved (re-enabling
-        // restores it rather than resurrecting a wiped default).
-        assert_eq!(cfg.gesture_owner("2b042"), None);
-        match cfg.bindings_for("2b042").get(&ButtonId::GestureButton) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(map.get(&GestureDirection::Up), Some(&Action::Copy));
-            }
-            other => panic!("expected the gesture map preserved while off, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gesture_owner_field_roundtrips_as_a_scalar() {
-        let mut cfg = Config::default();
-        cfg.set_gesture_owner("2b042", ButtonId::Back); // explicit button
-        cfg.disable_gestures("4082d"); // explicit off
-
-        let parsed = write_and_read(&cfg);
-        assert_eq!(parsed.gesture_owner("2b042"), Some(ButtonId::Back));
-        assert_eq!(parsed.gesture_owner("4082d"), None);
-
-        // The custom codec keeps it a bare TOML string (a nested table would risk
-        // a value-after-table serialization error, since `bindings` is a table).
-        let body = toml::to_string_pretty(&cfg).expect("serialize");
-        assert!(body.contains("gesture_owner = \"Back\""), "got: {body}");
-        assert!(body.contains("gesture_owner = \"Off\""), "got: {body}");
-    }
-
-    #[test]
-    fn invalid_gesture_owner_string_is_tolerated_not_fatal() {
-        // A hand-edit typo in gesture_owner must NOT fail the whole-document parse
-        // (which would revert every device's settings to defaults). It degrades
-        // to "infer" while the rest of the device config survives.
-        let toml = "\
-schema_version = 2
-
-[devices.2b042]
-gesture_owner = \"bogus\"
-
-[devices.2b042.bindings]
-Back = \"Copy\"
-";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        fs::write(&path, toml).expect("write");
-
-        let cfg =
-            Config::load_from_path(&path).expect("an invalid gesture_owner must not fail the load");
-        // The rest of the device config survived...
-        assert_eq!(
-            cfg.bindings_for("2b042").get(&ButtonId::Back),
-            Some(&Binding::Single(Action::Copy))
-        );
-        // ...and the bad owner degraded to inference (HID++ button default here).
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
-    }
+        overlays.get(&format!("exe:{}", executable_name.to_ascii_lowercase()))
+    })
 }

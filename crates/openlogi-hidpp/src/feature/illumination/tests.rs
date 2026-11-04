@@ -1,5 +1,7 @@
 //! Unit tests for `Illumination` payload parsing and event decoding.
 
+use std::assert_matches;
+
 use super::event::{IlluminationEvent, decode_event};
 use super::types::{
     BrightnessClampedSource, ControlCapabilities, ControlInfo, IlluminationState, LevelConfig,
@@ -160,10 +162,10 @@ fn rejects_invalid_non_linear_levels() {
             values: vec![1],
         },
     ] {
-        assert!(matches!(
+        assert_matches!(
             levels.to_payload(),
             Err(Hidpp20Error::Feature(ErrorType::InvalidArgument))
-        ));
+        );
     }
 }
 
@@ -218,4 +220,24 @@ fn decodes_brightness_clamped_event() {
 #[test]
 fn ignores_unknown_event_sub_id() {
     assert!(decode_event(9, &[0; 16]).is_none());
+}
+
+/// Totality: the clamp-source event must decode for any source byte; an
+/// unknown source folds to `Other(_)` and the brightness sibling survives.
+#[test]
+fn keeps_clamp_event_with_unknown_source() {
+    for byte in 0..=u8::MAX {
+        let mut payload = [0; 16];
+        payload[0] = byte; // BrightnessClampedSource
+        payload[1..3].copy_from_slice(&300u16.to_be_bytes()); // brightness sibling
+        let event = decode_event(4, &payload)
+            .unwrap_or_else(|| panic!("dropped clamp event for source {byte:#04x}"));
+        assert_eq!(
+            event,
+            IlluminationEvent::BrightnessClamped {
+                source: BrightnessClampedSource::from(byte),
+                brightness: 300,
+            }
+        );
+    }
 }

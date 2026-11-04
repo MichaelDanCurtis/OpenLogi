@@ -1,5 +1,7 @@
 //! Unit tests for `ExtendedAdjustableDpi` payload parsing and event decoding.
 
+use std::assert_matches;
+
 use super::event::{ExtendedDpiEvent, decode_event};
 use super::types::{
     DpiCalibrationCorrection, DpiDirection, DpiRange, Lod, parse_dpi_list, parse_dpi_ranges,
@@ -120,20 +122,20 @@ fn parses_range_followed_by_fixed_value() {
 fn rejects_hyphen_without_preceding_value() {
     let stream = [0xe0, 0x01, 0x01, 0x90, 0x00, 0x00];
 
-    assert!(matches!(
+    assert_matches!(
         parse_dpi_ranges(&stream),
         Err(Hidpp20Error::UnsupportedResponse)
-    ));
+    );
 }
 
 #[test]
 fn rejects_hyphen_without_following_value() {
     let stream = [0x01, 0x90, 0xe0, 0x01, 0x00, 0x00];
 
-    assert!(matches!(
+    assert_matches!(
         parse_dpi_ranges(&stream),
         Err(Hidpp20Error::UnsupportedResponse)
-    ));
+    );
 }
 
 #[test]
@@ -141,30 +143,30 @@ fn rejects_zero_step_unused_marker() {
     // 0xe000 is the documented "unused" marker (step 0); it is not a valid range.
     let stream = [0x01, 0x90, 0xe0, 0x00, 0x04, 0xb0, 0x00, 0x00];
 
-    assert!(matches!(
+    assert_matches!(
         parse_dpi_ranges(&stream),
         Err(Hidpp20Error::UnsupportedResponse)
-    ));
+    );
 }
 
 #[test]
 fn rejects_descending_stepped_range() {
     let stream = [0x06, 0x40, 0xe0, 0x32, 0x01, 0x90, 0x00, 0x00];
 
-    assert!(matches!(
+    assert_matches!(
         parse_dpi_ranges(&stream),
         Err(Hidpp20Error::UnsupportedResponse)
-    ));
+    );
 }
 
 #[test]
 fn rejects_unterminated_dpi_ranges() {
     let stream = [0x01, 0x90, 0x03, 0x20];
 
-    assert!(matches!(
+    assert_matches!(
         parse_dpi_ranges(&stream),
         Err(Hidpp20Error::UnsupportedResponse)
-    ));
+    );
 }
 
 #[test]
@@ -172,7 +174,7 @@ fn parses_dpi_list_with_terminator() {
     // Spec example: a profile configured to 400, 800 and 1600 DPI.
     let bytes = [0x01, 0x90, 0x03, 0x20, 0x06, 0x40, 0x00, 0x00];
 
-    assert_eq!(parse_dpi_list(&bytes).unwrap(), [400, 800, 1600]);
+    assert_eq!(parse_dpi_list(&bytes), [400, 800, 1600]);
 }
 
 #[test]
@@ -180,7 +182,7 @@ fn parses_dpi_list_filling_payload() {
     // A full list leaves no room for the terminator.
     let bytes = [0x01, 0x90, 0x03, 0x20];
 
-    assert_eq!(parse_dpi_list(&bytes).unwrap(), [400, 800]);
+    assert_eq!(parse_dpi_list(&bytes), [400, 800]);
 }
 
 #[test]
@@ -197,20 +199,20 @@ fn parses_lod_list() {
 fn rejects_unknown_lod_value() {
     let bytes = [9];
 
-    assert!(matches!(
+    assert_matches!(
         parse_lod_list(&bytes, 1),
         Err(Hidpp20Error::UnsupportedResponse)
-    ));
+    );
 }
 
 #[test]
 fn rejects_lod_list_longer_than_payload() {
     let bytes = [1, 2];
 
-    assert!(matches!(
+    assert_matches!(
         parse_lod_list(&bytes, 3),
         Err(Hidpp20Error::UnsupportedResponse)
-    ));
+    );
 }
 
 #[test]
@@ -227,7 +229,7 @@ fn decodes_parameters_changed_event() {
     assert_eq!(event.sensor_index, 1);
     assert_eq!(event.dpi_x, 800);
     assert_eq!(event.dpi_y, 1600);
-    assert_eq!(event.lod, Lod::Medium);
+    assert_eq!(event.lod, Some(Lod::Medium));
 }
 
 #[test]
@@ -240,7 +242,7 @@ fn decodes_calibration_completed_event() {
     let ExtendedDpiEvent::CalibrationCompleted(event) = decode_event(1, &payload).unwrap() else {
         panic!("expected a calibration-completed event");
     };
-    assert_eq!(event.direction, DpiDirection::Y);
+    assert_eq!(event.direction, Some(DpiDirection::Y));
     assert_eq!(event.correction, 100);
     assert_eq!(event.delta, -1);
     assert!(!event.failed());
@@ -263,11 +265,37 @@ fn ignores_unknown_event_sub_id() {
 }
 
 #[test]
-fn ignores_event_with_unknown_lod() {
+fn keeps_event_with_unknown_lod() {
     let mut payload = [0; 16];
+    payload[0] = 3; // sensor index — a valid sibling that must survive
     payload[5] = 9;
 
-    assert!(decode_event(0, &payload).is_none());
+    let ExtendedDpiEvent::ParametersChanged(changed) =
+        decode_event(0, &payload).expect("event kept")
+    else {
+        panic!("expected ParametersChanged");
+    };
+    // Lod stays a closed, write-safe enum; an unknown lift-off value surfaces
+    // as None on the event without dropping the DPI change.
+    assert_eq!(changed.lod, None);
+    assert_eq!(changed.sensor_index, 3);
+}
+
+/// Totality: a known event sub-id must decode for any enum-field byte value.
+#[test]
+fn known_sub_id_survives_any_field_byte() {
+    for byte in 0..=u8::MAX {
+        // sub 0: Lod at payload[5]; sub 1: DpiDirection at payload[1].
+        for (sub_id, pos) in [(0u8, 5usize), (1, 1)] {
+            let mut payload = [0; 16];
+            payload[0] = 3; // sensor index sibling
+            payload[pos] = byte;
+            assert!(
+                decode_event(sub_id, &payload).is_some(),
+                "dropped sub {sub_id} for payload[{pos}]={byte:#04x}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -294,9 +322,9 @@ fn rejects_out_of_range_calibration_corrections() {
         DpiCalibrationCorrection::Adjust(1024),
         DpiCalibrationCorrection::Adjust(i16::MIN),
     ] {
-        assert!(matches!(
+        assert_matches!(
             correction.to_wire(),
             Err(Hidpp20Error::Feature(ErrorType::InvalidArgument))
-        ));
+        );
     }
 }

@@ -28,7 +28,7 @@ fn parses_eq_info_with_explicit_range() {
     payload[0] = 5;
     payload[1] = 0x0c;
     payload[2] = EqCapabilities::STORED_AS_GAINS.bits();
-    payload[3] = (-6i8) as u8;
+    payload[3] = (-6i8).cast_unsigned();
     payload[4] = 9;
 
     let info = EqInfo::from_payload(&payload);
@@ -67,7 +67,10 @@ fn parses_partial_frequency_page() {
 #[test]
 fn rejects_oversized_frequency_page() {
     // A page can hold at most seven u16 values after the index byte.
-    assert!(parse_frequency_page(&[0; 16], 8).is_err());
+    assert!(
+        parse_frequency_page(&[0; 16], 8).is_err(),
+        "a page can hold at most seven frequencies after the index byte"
+    );
 }
 
 #[test]
@@ -90,7 +93,7 @@ fn parses_echoed_gains_after_persistence_byte() {
     // offset 1 recovers them.
     let mut payload = [0; 16];
     payload[0] = 1; // echoed persistence
-    payload[1] = (-4i8) as u8;
+    payload[1] = (-4i8).cast_unsigned();
     payload[2] = 4;
 
     assert_eq!(parse_gains(&payload, 1, 3).unwrap(), [-4, 4, 0]);
@@ -98,7 +101,10 @@ fn parses_echoed_gains_after_persistence_byte() {
 
 #[test]
 fn rejects_too_many_gains() {
-    assert!(parse_gains(&[0; 16], 1, 16).is_err());
+    assert!(
+        parse_gains(&[0; 16], 1, 16).is_err(),
+        "16 gains at offset 1 overflow the 16-byte payload"
+    );
 }
 
 #[test]
@@ -106,5 +112,8 @@ fn maps_enum_wire_values() {
     assert_eq!(u8::from(GainLocation::Ram), 1);
     assert_eq!(GainLocation::try_from(0u8).unwrap(), GainLocation::Eeprom);
     assert_eq!(u8::from(GainPersistence::NonVolatileOnly), 2);
-    assert!(GainPersistence::try_from(3u8).is_err());
+    assert!(
+        GainPersistence::try_from(3u8).is_err(),
+        "3 is not a valid GainPersistence wire value"
+    );
 }

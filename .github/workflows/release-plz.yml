@@ -8,11 +8,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Keep Cargo/sccache inputs aligned with CI.
+  RUSTFLAGS: "-D warnings"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_RW_MODE: READ_WRITE
 
 jobs:
-  # Opens/updates a release PR that bumps the shared workspace version and writes
-  # changelogs from the conventional commits since the last release. Merging that
-  # PR is what triggers the actual release in the job below.
   release-pr:
     name: release-plz PR
     runs-on: ubuntu-latest
@@ -23,20 +25,26 @@ jobs:
       group: release-plz-pr-${{ github.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.16.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-cargo
+          shared-key: linux-stable-debug
+          cache-targets: false
+          save-if: false
       - name: Install Linux build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libudev-dev pkg-config gcc g++ clang libssl-dev libzstd-dev
-      # GitHub App token (not a PAT) so the release PR / tag trigger CI and the
-      # DMG release workflow — the default GITHUB_TOKEN cannot trigger workflows.
-      # App credentials come from the same 1Password item as release.yml.
+      # GITHUB_TOKEN pushes do not trigger downstream workflows.
       - name: Mint GitHub App token
         id: app-token
         uses: ./.github/actions/github-app-token-from-1password
@@ -44,114 +52,157 @@ jobs:
           op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
           op-github-app-item: ${{ secrets.OP_GITHUB_APP_ITEM }}
       - name: Run release-plz (release-pr)
-        id: release_pr
         uses: release-plz/action@v0.5
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           CARGO_REGISTRY_TOKEN: ${{ steps.app-token.outputs.cargo-registry-token }}
-      # `release-plz/action` swallows a release-pr HTTP 422 as a warning and
-      # reports no PR, which silently stalls releases (it looks identical to a
-      # quiet week of commits). Fail loudly when release-plz opened/updated no
-      # release PR, none is already open, yet release-worthy commits exist since
-      # the last tag — that combination means a swallowed failure, not a no-op.
-      # (The blanket 422-swallow is an acknowledged action hack: release-plz/action#264
-      # added it to fix that action's own CI; #427 aims to remove it. Once #427
-      # lands and we pin an action release that includes it, this guard can go.)
-      - name: Guard against a silently stalled release
-        if: steps.release_pr.outputs.prs_created == 'false'
-        uses: actions/github-script@v8
+      # release-plz skips release=false app crates; git-cliff covers the whole repo.
+      - name: Find current release PR
+        id: open_release_pr
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const openPulls = await github.paginate(github.rest.pulls.list, {
+              ...context.repo,
+              state: "open",
+              per_page: 100,
+            });
+            const releasePulls = openPulls.filter(({ head }) =>
+              head.ref.startsWith("release-plz/") &&
+              head.repo?.full_name === `${context.repo.owner}/${context.repo.repo}`
+            );
+            let pull;
+            for (const candidate of releasePulls) {
+              const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
+                ...context.repo,
+                basehead: `${context.sha}...${candidate.head.sha}`,
+              });
+              if (comparison.status === "ahead" || comparison.status === "identical") {
+                pull = candidate;
+                break;
+              }
+              core.info(`Ignoring stale release PR #${candidate.number}: ${comparison.status}`);
+            }
+            if (pull) {
+              core.setOutput("branch", pull.head.ref);
+              core.setOutput("number", pull.number);
+            }
+      - name: Build changelog writer
+        if: steps.open_release_pr.outputs.branch != ''
+        run: cargo build -p xtask
+      - name: Check out release PR
+        if: steps.open_release_pr.outputs.branch != ''
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.open_release_pr.outputs.branch }}
+          fetch-depth: 0
+          path: release-pr
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Install git-cliff
+        if: steps.open_release_pr.outputs.branch != ''
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff@2.13.1
+          fallback: none
+      - name: Write root changelog with git-cliff
+        if: steps.open_release_pr.outputs.branch != ''
+        working-directory: release-pr
+        run: ../target/debug/xtask release changelog --config ../.config/cliff.toml
+      - name: Commit root changelog
+        if: steps.open_release_pr.outputs.branch != ''
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          branch: ${{ steps.open_release_pr.outputs.branch }}
+          commit_message: "chore(release): write whole-repo changelog"
+          file_pattern: CHANGELOG.md
+          repository: release-pr
+          commit_user_name: "aprilnea[bot]"
+          commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
+          commit_author: "aprilnea[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+      # OpenLogi's whole-repo changelog is the release PR body.
+      - name: Replace release PR body with changelog
+        if: steps.open_release_pr.outputs.number != ''
+        uses: actions/github-script@v9
+        env:
+          RELEASE_PR_NUMBER: ${{ steps.open_release_pr.outputs.number }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const { readFileSync } = require("node:fs");
             const { owner, repo } = context.repo;
-
-            // An already-open release PR is the normal "updated, not created" path.
-            const openPulls = await github.paginate(github.rest.pulls.list, {
+            const pullNumber = Number(process.env.RELEASE_PR_NUMBER);
+            const { data: pull } = await github.rest.pulls.get({
               owner,
               repo,
-              state: "open",
-              per_page: 100,
+              pull_number: pullNumber,
             });
-            if (openPulls.some((pull) => pull.head.ref.startsWith("release-plz/"))) {
-              core.info("A release PR is already open — nothing to flag.");
+
+            const changelog = readFileSync("release-pr/CHANGELOG.md", "utf8");
+            const heading = /^## \[(?!Unreleased\])[^\]]+\][^\n]*$/m.exec(changelog);
+            if (!heading) {
+              core.setFailed("CHANGELOG.md has no release section.");
               return;
             }
-
-            const tags = await github.paginate(github.rest.repos.listTags, {
-              owner,
-              repo,
-              per_page: 100,
-            });
-            const lastTag = tags
-              .map((tag) => tag.name)
-              .filter((tag) => /^v\d+\.\d+\.\d+/.test(tag))
-              .sort((left, right) => right.localeCompare(left, undefined, { numeric: true, sensitivity: "base" }))[0] ?? "";
-
-            // The release job runs in parallel and cuts the `v{version}` tag only
-            // after publishing, so that tag is usually absent from this job's
-            // checkout — never trust the local tag list to decide "did a release
-            // just happen". Read the manifest instead: merging a release PR bumps
-            // the workspace version, so a manifest version ahead of the last tag
-            // means the release already landed (the parallel job is tagging it),
-            // not a stall. Only when the manifest still sits at the last released
-            // tag can leftover release-worthy commits mean a swallowed release-pr.
-            const manifestVersion = readFileSync("Cargo.toml", "utf8")
-              .match(/\[workspace\.package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1] ?? "";
-            if (lastTag && manifestVersion && `v${manifestVersion}` !== lastTag) {
-              core.info(`Workspace version ${manifestVersion} is ahead of ${lastTag} — a release PR already merged; the release job cuts the tag. Nothing to flag.`);
+            const start = heading.index;
+            const end = changelog.indexOf("\n## [", start);
+            const body = changelog.slice(start, end === -1 ? undefined : end).trim();
+            if (pull.body === body) {
+              core.info("Release PR body changelog already complete.");
               return;
             }
+            await github.rest.pulls.update({ owner, repo, pull_number: pullNumber, body });
 
-            const commits = lastTag
-              ? (await github.rest.repos.compareCommitsWithBasehead({
-                  owner,
-                  repo,
-                  basehead: `${lastTag}...${context.sha}`,
-                })).data.commits
-              : await github.paginate(github.rest.repos.listCommits, {
-                  owner,
-                  repo,
-                  sha: context.sha,
-                  per_page: 100,
-                });
-            const worthy = commits.filter(({ commit }) => /^(feat|fix|perf)(\(.+\))?!?:|^[a-z]+(\(.+\))?!:/.test(commit.message.split("\n")[0])).length;
-            if (worthy !== 0) {
-              core.setFailed(`release-plz opened no release PR, but ${worthy} release-worthy commit(s) exist since ${lastTag || "repo start"} and none is open — likely a swallowed release-plz failure (see the release-pr step).`);
-              return;
-            }
-            core.info(`No release PR and no release-worthy commits since ${lastTag || "repo start"}; nothing to release.`);
-
-  # On every push to master, publishes any crate whose manifest version is not yet
-  # on crates.io — i.e. a no-op until the release PR is merged, at which point it
-  # publishes the whole workspace and cuts one `v{version}` tag + GitHub Release.
+  # Never publish or tag a master tip newer than the version-bump commit.
   release:
     name: release-plz release
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.head_commit.message, 'chore: release')
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.16.0"
+      # Restore Cargo inputs before compiling the xtask that selects the
+      # version-bump commit. Compiler outputs come from sccache across commits.
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-cargo
+          shared-key: linux-stable-debug
+          cache-targets: false
+          save-if: false
+      - name: Check out the version-bump commit
+        id: release_commit
+        run: cargo xtask release checkout-version-bump
       - name: Install Linux build deps
+        if: steps.release_commit.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libudev-dev pkg-config gcc g++ clang libssl-dev libzstd-dev
+      - name: Verify publish closure
+        if: steps.release_commit.outputs.skip != 'true'
+        run: cargo xtask release check-publish
       - name: Mint GitHub App token
+        if: steps.release_commit.outputs.skip != 'true'
         id: app-token
         uses: ./.github/actions/github-app-token-from-1password
         with:
           op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
           op-github-app-item: ${{ secrets.OP_GITHUB_APP_ITEM }}
       - name: Run release-plz (release)
+        if: steps.release_commit.outputs.skip != 'true'
         uses: release-plz/action@v0.5
         with:
           command: release

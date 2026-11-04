@@ -1,0 +1,491 @@
+//! Keep configured keyboard → pointing-device host-switch links armed.
+
+use std::thread;
+use std::time::Duration;
+
+use openlogi_core::binding::Action;
+use openlogi_core::config::{HostSwitchActions, HostSwitchTrigger};
+use openlogi_hid::{
+    ChannelPool, DeviceIoGate, DeviceRoute, HostSwitchStopReason, run_host_switch_session,
+    switch_linked_hosts_with,
+};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::Instant;
+use tracing::{debug, warn};
+
+use crate::receiver_access::{ExclusiveAccessReason, ReceiverAccess, ReceiverRequestState};
+use crate::runtime::ActionDispatcher;
+
+const DEPARTURE_TIMEOUT: Duration = Duration::from_secs(10);
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// One resolved link. Config keys are converted to live routes by the
+/// orchestrator so the transport watcher never needs to understand inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSwitchLink {
+    /// The keyboard's config key, handed to hook actions as
+    /// `OPENLOGI_DEVICE_KEY`.
+    pub keyboard_key: String,
+    /// Keyboard whose host switch keys initiate the transition.
+    pub keyboard: DeviceRoute,
+    /// Pointing devices that follow the keyboard.
+    pub targets: Vec<DeviceRoute>,
+    /// Actions fired around the transition.
+    pub actions: HostSwitchActions,
+}
+
+/// Read-only, lossless, coalescing view of resolved links.
+pub type HostSwitchLinks = watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>;
+
+/// Spawn the host switch session manager.
+pub fn spawn(
+    links: &HostSwitchLinks,
+    channel_pool: ChannelPool,
+    receiver_access: ReceiverAccess,
+    device_io: DeviceIoGate,
+    dispatcher: ActionDispatcher,
+) {
+    let links = links.clone();
+    let receiver_requests = receiver_access.subscribe_requests();
+    thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                warn!(%error, "host switch watcher: could not build tokio runtime");
+                return;
+            }
+        };
+        runtime.block_on(manage(
+            links,
+            channel_pool,
+            receiver_access,
+            receiver_requests,
+            device_io,
+            dispatcher,
+        ));
+    });
+}
+
+struct HostSwitchManagerState {
+    sessions: Vec<RunningSession>,
+    next_generation: u64,
+    restart_after: Vec<(HostSwitchLink, Instant)>,
+}
+
+impl HostSwitchManagerState {
+    fn new() -> Self {
+        Self {
+            sessions: Vec::new(),
+            next_generation: 0,
+            restart_after: Vec::new(),
+        }
+    }
+
+    fn deadline(&self, requests: ReceiverRequestState, device_io_allowed: bool) -> Option<Instant> {
+        if requests.any() || !device_io_allowed {
+            return None;
+        }
+        self.restart_after
+            .iter()
+            .map(|(_, deadline)| *deadline)
+            .min()
+    }
+
+    async fn reconcile(
+        &mut self,
+        requests: ReceiverRequestState,
+        published: &std::sync::Arc<Vec<HostSwitchLink>>,
+        receiver_access: &ReceiverAccess,
+        channel_pool: &ChannelPool,
+        done: &mpsc::UnboundedSender<SessionCompletion>,
+        device_io: &DeviceIoGate,
+    ) {
+        // Keep armed listeners passive while sleeping. A reconcile to an
+        // empty/changed link set would restore firmware controls and a retry
+        // would reopen the HID transport during DarkWake.
+        if !device_io.allows_io() {
+            return;
+        }
+        let now = Instant::now();
+        let wanted = if requests.any() {
+            &[][..]
+        } else {
+            published.as_slice()
+        };
+        stop_unwanted(&mut self.sessions, wanted).await;
+        self.restart_after
+            .retain(|(link, _)| published.contains(link));
+        for link in wanted {
+            if self.sessions.iter().any(|session| session.link == *link)
+                || self
+                    .restart_after
+                    .iter()
+                    .any(|(delayed, deadline)| delayed == link && *deadline > now)
+            {
+                continue;
+            }
+            self.restart_after.retain(|(delayed, _)| delayed != link);
+            let Some(receiver_lease) = receiver_access.try_acquire_for_session() else {
+                self.restart_after.push((link.clone(), now + RETRY_DELAY));
+                break;
+            };
+            self.next_generation = self.next_generation.wrapping_add(1);
+            self.sessions.push(spawn_session(
+                link.clone(),
+                self.next_generation,
+                receiver_lease,
+                channel_pool.clone(),
+                done.clone(),
+                device_io.clone(),
+            ));
+        }
+    }
+}
+
+async fn manage(
+    mut links: watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>,
+    channel_pool: ChannelPool,
+    receiver_access: ReceiverAccess,
+    mut receiver_requests: watch::Receiver<ReceiverRequestState>,
+    mut device_io: DeviceIoGate,
+    dispatcher: ActionDispatcher,
+) {
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<SessionCompletion>();
+    let mut state = HostSwitchManagerState::new();
+    let mut reconcile = true;
+
+    loop {
+        if reconcile {
+            reconcile = false;
+            let device_io_allowed = device_io.allows_io();
+            if device_io_allowed {
+                let requests = *receiver_requests.borrow_and_update();
+                let published = std::sync::Arc::clone(&links.borrow_and_update());
+                state
+                    .reconcile(
+                        requests,
+                        &published,
+                        &receiver_access,
+                        &channel_pool,
+                        &done_tx,
+                        &device_io,
+                    )
+                    .await;
+            }
+        }
+
+        let requests = *receiver_requests.borrow();
+        let deadline = state.deadline(requests, device_io.allows_io());
+        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+            reconcile = true;
+            continue;
+        }
+
+        tokio::select! {
+            Some(completion) = done_rx.recv() => {
+                if let Some(index) = state.sessions
+                    .iter()
+                    .position(|session| session.generation == completion.generation)
+                {
+                    let completed = state.sessions.remove(index);
+                    let _ = completed.task.await;
+                    if let Some((link, host)) = completion.request {
+                        if !device_io.wait_until_allowed().await {
+                            return;
+                        }
+                        stop_all(&mut state.sessions, HostSwitchStopReason::Graceful).await;
+                        run_transition(
+                            &mut links,
+                            &channel_pool,
+                            &receiver_access,
+                            &dispatcher,
+                            link,
+                            host,
+                            HostSwitchTrigger::Key,
+                        )
+                        .await;
+                    } else if device_io.allows_io() {
+                        state.restart_after.push((completed.link, Instant::now() + RETRY_DELAY));
+                    }
+                    reconcile = true;
+                }
+            }
+            result = links.changed() => {
+                if result.is_err() {
+                    return;
+                }
+                reconcile = true;
+            }
+            result = receiver_requests.changed() => {
+                if result.is_err() {
+                    return;
+                }
+                reconcile = true;
+            }
+            allowed = device_io.changed() => match allowed {
+                Some(true) => reconcile = true,
+                Some(false) => {}
+                None => return,
+            },
+            () = wait_for_deadline(deadline) => {
+                reconcile = true;
+            }
+        }
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn spawn_session(
+    link: HostSwitchLink,
+    generation: u64,
+    receiver_lease: crate::receiver_access::SessionReceiverLease,
+    pool: ChannelPool,
+    done: mpsc::UnboundedSender<SessionCompletion>,
+    device_io: DeviceIoGate,
+) -> RunningSession {
+    let (stop, stop_rx) = oneshot::channel();
+    let session_link = link.clone();
+    let task = tokio::spawn(async move {
+        let _receiver_lease = receiver_lease;
+        let keyboard = session_link.keyboard.clone();
+        let request =
+            match run_host_switch_session(session_link.keyboard.clone(), stop_rx, pool, device_io)
+                .await
+            {
+                Ok(host) => host.map(|host| (session_link, host)),
+                Err(error) => {
+                    debug!(%error, route = %keyboard, "host switch session ended");
+                    None
+                }
+            };
+        let _ = done.send(SessionCompletion {
+            generation,
+            request,
+        });
+    });
+    RunningSession {
+        link,
+        generation,
+        stop,
+        task,
+    }
+}
+
+struct RunningSession {
+    link: HostSwitchLink,
+    generation: u64,
+    stop: oneshot::Sender<HostSwitchStopReason>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct SessionCompletion {
+    generation: u64,
+    request: Option<(HostSwitchLink, u8)>,
+}
+
+async fn stop_all(sessions: &mut Vec<RunningSession>, reason: HostSwitchStopReason) {
+    let running = std::mem::take(sessions);
+    let mut tasks = Vec::with_capacity(running.len());
+    for RunningSession { stop, task, .. } in running {
+        let _ = stop.send(reason);
+        tasks.push(task);
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
+async fn stop_unwanted(sessions: &mut Vec<RunningSession>, wanted: &[HostSwitchLink]) {
+    let mut index = 0;
+    while index < sessions.len() {
+        if wanted.contains(&sessions[index].link) {
+            index += 1;
+            continue;
+        }
+        let RunningSession { stop, task, .. } = sessions.remove(index);
+        let _ = stop.send(HostSwitchStopReason::Graceful);
+        let _ = task.await;
+    }
+}
+
+async fn run_transition(
+    links: &mut watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>,
+    channel_pool: &ChannelPool,
+    receiver_access: &ReceiverAccess,
+    dispatcher: &ActionDispatcher,
+    link: HostSwitchLink,
+    host: u8,
+    trigger: HostSwitchTrigger,
+) {
+    let _lease = receiver_access
+        .acquire_exclusive(ExclusiveAccessReason::HostTransition)
+        .await;
+    let fire = || {
+        if !fire_slot_action(dispatcher, &link, host, trigger) && !link.actions.is_empty() {
+            debug!(host, route = %link.keyboard, "no host switch action configured for slot");
+        }
+    };
+    match switch_linked_hosts_with(&link.keyboard, &link.targets, host, channel_pool, fire).await {
+        Ok(true) => wait_for_departure(links, &link.keyboard).await,
+        Ok(false) => {}
+        Err(error) => {
+            debug!(%error, route = %link.keyboard, host, "keyboard host switch failed");
+        }
+    }
+}
+
+/// The action and environment for a switch of `link`'s keyboard to 0-based
+/// `host`, or `None` when that slot has no action configured.
+fn plan_slot_action(
+    link: &HostSwitchLink,
+    host: u8,
+    trigger: HostSwitchTrigger,
+) -> Option<(&Action, Vec<(String, String)>)> {
+    let action = link.actions.for_host_index(host)?;
+    Some((action, trigger.hook_env(&link.keyboard_key, Some(host))))
+}
+
+/// Fire the configured slot action, fire-and-forget. Returns whether one was
+/// configured. Never awaited by the transition: the dispatcher hands script
+/// actions to a worker thread and returns immediately.
+fn fire_slot_action(
+    dispatcher: &ActionDispatcher,
+    link: &HostSwitchLink,
+    host: u8,
+    trigger: HostSwitchTrigger,
+) -> bool {
+    let Some((action, env)) = plan_slot_action(link, host, trigger) else {
+        return false;
+    };
+    debug!(host, route = %link.keyboard, trigger = trigger.as_str(), "firing host switch action");
+    dispatcher.dispatch_hook(action, Some(&link.keyboard_key), &env);
+    true
+}
+
+async fn wait_for_departure(
+    links: &mut watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>,
+    keyboard: &DeviceRoute,
+) {
+    let deadline = tokio::time::sleep(DEPARTURE_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        let departed = !links
+            .borrow_and_update()
+            .iter()
+            .any(|link| link.keyboard == *keyboard);
+        if departed {
+            return;
+        }
+        tokio::select! {
+            result = links.changed() => {
+                if result.is_err() {
+                    return;
+                }
+            }
+            () = &mut deadline => {
+                warn!(route = %keyboard, "host transition departure was not observed");
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(slot: u8) -> DeviceRoute {
+        DeviceRoute::Bolt {
+            receiver_uid: "cafe".to_owned(),
+            slot,
+        }
+    }
+
+    #[test]
+    fn suspended_device_io_disables_retry_deadlines() {
+        let retry_at = Instant::now() + RETRY_DELAY;
+        let mut state = HostSwitchManagerState::new();
+        state.restart_after.push((
+            HostSwitchLink {
+                keyboard_key: "keyboard".into(),
+                keyboard: route(1),
+                targets: vec![route(2)],
+                actions: HostSwitchActions::default(),
+            },
+            retry_at,
+        ));
+
+        assert_eq!(
+            state.deadline(ReceiverRequestState::default(), true),
+            Some(retry_at),
+        );
+        assert_eq!(
+            state.deadline(ReceiverRequestState::default(), false),
+            None,
+            "host-switch retries must stay dormant until visible resume",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn departure_publication_finishes_wait_without_advancing_time() {
+        let keyboard = route(1);
+        let link = HostSwitchLink {
+            keyboard_key: "keyboard".into(),
+            keyboard: keyboard.clone(),
+            targets: vec![route(2)],
+            actions: HostSwitchActions::default(),
+        };
+        let (links, mut published) = watch::channel(std::sync::Arc::new(vec![link]));
+        let started = Instant::now();
+        let waiting = tokio::spawn(async move {
+            wait_for_departure(&mut published, &keyboard).await;
+            Instant::now()
+        });
+        tokio::task::yield_now().await;
+
+        links.send_replace(std::sync::Arc::new(Vec::new()));
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            waiting.await.expect("departure waiter should finish"),
+            started,
+            "the link publication should reconcile departure immediately"
+        );
+    }
+
+    #[test]
+    fn slot_action_env_names_the_keyboard_and_one_based_slot() {
+        let link = HostSwitchLink {
+            keyboard_key: "unit:7b520554".into(),
+            keyboard: route(1),
+            targets: Vec::new(),
+            actions: HostSwitchActions {
+                slot_3: Some(openlogi_core::binding::Action::RunShellCommand("x".into())),
+                ..HostSwitchActions::default()
+            },
+        };
+        let (action, env) =
+            plan_slot_action(&link, 2, HostSwitchTrigger::Key).expect("slot 3 is configured");
+        assert_eq!(
+            action,
+            &openlogi_core::binding::Action::RunShellCommand("x".into())
+        );
+        assert!(env.contains(&("OPENLOGI_HOST_SLOT".to_string(), "3".to_string())));
+        assert!(env.contains(&(
+            "OPENLOGI_DEVICE_KEY".to_string(),
+            "unit:7b520554".to_string()
+        )));
+        assert!(env.contains(&("OPENLOGI_TRIGGER".to_string(), "key".to_string())));
+        assert!(plan_slot_action(&link, 0, HostSwitchTrigger::Key).is_none());
+    }
+}

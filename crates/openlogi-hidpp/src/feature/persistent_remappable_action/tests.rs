@@ -1,5 +1,7 @@
 //! Unit tests for `PersistentRemappableAction` payload parsing.
 
+use std::assert_matches;
+
 use super::{ActionId, HostMask, ModifierMask, PersistentAction, RemappableCapabilities};
 use crate::feature::{hosts_info::HostIndex, reprog_controls::ControlId};
 
@@ -58,17 +60,17 @@ fn rejects_unknown_action_id() {
     let mut payload = [0; 16];
     payload[3] = 0x55;
 
-    assert!(matches!(
+    assert_matches!(
         PersistentAction::from_payload(&payload),
         Err(crate::protocol::v20::Hidpp20Error::UnsupportedResponse)
-    ));
+    );
 }
 
 #[test]
 fn maps_action_id_wire_values() {
     assert_eq!(ActionId::try_from(0x01u8).unwrap(), ActionId::SendKeyboard);
     assert_eq!(ActionId::try_from(0x09u8).unwrap(), ActionId::SendPowerKey);
-    assert!(ActionId::try_from(0x00u8).is_err());
+    ActionId::try_from(0x00u8).unwrap_err();
     assert_eq!(u8::from(ActionId::SendConsumerControl), 0x07);
 }
 

@@ -60,5 +60,5 @@ fn ignores_unknown_event_sub_id() {
 fn maps_led_wire_values() {
     assert_eq!(u8::from(LedId::Off), 0);
     assert_eq!(LedId::try_from(3u8).unwrap(), LedId::Green);
-    assert!(LedId::try_from(4u8).is_err());
+    LedId::try_from(4u8).unwrap_err();
 }

@@ -8,13 +8,26 @@ use crate::support::fs::{absolutize, ensure_command, ensure_file, repo_root};
 
 #[derive(Parser)]
 pub(crate) struct Args {
-    /// Output directory for .deb and .rpm packages (default: target/release).
+    /// Output directory for .deb, .rpm, and .pkg.tar.zst packages (default: target/release).
     #[arg(long, default_value = "target/release")]
     output: PathBuf,
     /// Skip the cargo build step (binaries must already exist in target/release).
     #[arg(long)]
     no_build: bool,
 }
+
+/// The binaries `packaging/linux/nfpm.yaml` installs into `/usr/bin`.
+///
+/// One list drives both the build and the existence check below. They used to
+/// be written out separately and drifted: the build stopped one short of the
+/// package, so `openlogi-overlay` only ever reached a `.deb` when a cached
+/// `target/release` happened to still hold one from an earlier run.
+const PACKAGED_BINS: [&str; 4] = [
+    "openlogi",
+    "openlogi-desktop",
+    "openlogi-overlay",
+    "openlogi-agent",
+];
 
 pub(crate) fn run(args: &Args) -> Result<()> {
     let root = repo_root()?;
@@ -23,14 +36,11 @@ pub(crate) fn run(args: &Args) -> Result<()> {
 
     if !args.no_build {
         println!("==> build release binaries");
-        cmd!(
-            sh,
-            "cargo build --release -p openlogi -p openlogi-gui -p openlogi-agent"
-        )
-        .run()?;
+        let packages: Vec<&str> = PACKAGED_BINS.iter().flat_map(|&bin| ["-p", bin]).collect();
+        cmd!(sh, "cargo build --release {packages...}").run()?;
     }
 
-    for bin in ["openlogi", "openlogi-gui", "openlogi-agent"] {
+    for bin in PACKAGED_BINS {
         ensure_file(&root.join("target/release").join(bin))?;
     }
 
@@ -48,7 +58,7 @@ pub(crate) fn run(args: &Args) -> Result<()> {
         other => anyhow::bail!("unsupported Linux package architecture: {other}"),
     };
 
-    for packager in ["deb", "rpm"] {
+    for packager in ["deb", "rpm", "archlinux"] {
         println!("==> nfpm {packager} ({pkg_arch})");
         cmd!(
             sh,
@@ -63,3 +73,6 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     println!("Linux packages written to {}", output.display());
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

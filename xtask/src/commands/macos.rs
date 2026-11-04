@@ -1,34 +1,57 @@
 pub(crate) mod bundle;
+pub(crate) mod dev_bundle;
 pub(crate) mod dmg;
 
 use anyhow::Result;
-use clap::Subcommand;
+use clap::{Parser, Subcommand};
+
+use crate::icon::IconPipeline as _;
+use crate::icon::macos::AppBundle;
+use bundle::identity::Channel;
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
-    /// Generate the macOS app icon from the master PNG.
-    Icns,
-    /// Build the release OpenLogi.app bundle.
-    Bundle,
+    /// Compile the macOS app icon from its Icon Composer document.
+    Icon,
+    /// Build the OpenLogi.app bundle.
+    Bundle(BundleArgs),
+    /// Wrap a freshly built desktop binary in `target/dev/OpenLogi.app`.
+    /// Driven by the cargo runner; not normally run by hand.
+    DevBundle(dev_bundle::Args),
     /// Create the branded macOS DMG from an existing app bundle.
     Dmg(dmg::Args),
-    /// Build the app bundle, optionally sign it, and package the branded DMG.
-    Package(dmg::Args),
+    /// Build the app bundle for distribution, optionally sign it, and package
+    /// the branded DMG.
+    Package(PackageArgs),
+}
+
+#[derive(Parser)]
+pub(crate) struct BundleArgs {
+    /// Identity family to stamp into the bundle. Defaults to `dev` so a local
+    /// build can never claim the installed app's permission grants or config;
+    /// the shipped bundle comes from `macos package`.
+    #[arg(long, value_enum, default_value_t = Channel::Dev)]
+    channel: Channel,
+}
+
+#[derive(Parser)]
+pub(crate) struct PackageArgs {
+    #[command(flatten)]
+    dmg: dmg::Args,
+    /// Rust target to package. Omit it for the host architecture.
+    #[arg(long, value_enum)]
+    target: Option<bundle::DistributionTarget>,
 }
 
 pub(crate) fn run(command: Command) -> Result<()> {
     match command {
-        Command::Icns => bundle::generate_icns(),
-        Command::Bundle => bundle::run(),
+        Command::Icon => AppBundle.compile(),
+        Command::Bundle(args) => bundle::run(args.channel),
+        Command::DevBundle(args) => dev_bundle::run(&args),
         Command::Dmg(args) => dmg::run(&args),
         Command::Package(args) => {
-            bundle::run()?;
-            if let Some(identity) = &args.sign_identity {
-                bundle::sign_app(identity)?;
-            } else {
-                println!("==> codesign: skipped (unsigned — set OPENLOGI_SIGN_IDENTITY to sign)");
-            }
-            dmg::run(&args)
+            bundle::run_for_distribution(args.dmg.sign_identity.as_deref(), args.target)?;
+            dmg::run(&args.dmg)
         }
     }
 }

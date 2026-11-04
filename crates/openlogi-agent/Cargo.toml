@@ -14,32 +14,59 @@ publish = false
 name = "openlogi-agent"
 path = "src/main.rs"
 
+# Hardware-free mock agent for GUI development: serves a scripted inventory over
+# the real IPC socket. Dev-only — xtask bundles `openlogi-agent` by exact path,
+# so this binary never ships.
+[[bin]]
+name = "openlogi-agent-mock"
+path = "src/bin/mock_agent.rs"
+
 [dependencies]
 openlogi-agent-core = { path = "../openlogi-agent-core" }
 openlogi-core = { path = "../openlogi-core" }
 openlogi-hid = { path = "../openlogi-hid" }
 openlogi-hook = { path = "../openlogi-hook" }
-tarpc = { version = "0.37", features = ["serde1", "serde-transport", "serde-transport-bincode", "tokio1"] }
+openlogi-ipc = { path = "../openlogi-ipc" }
+tarpc = { workspace = true }
 interprocess = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "signal"] }
 futures = "0.3"
+rust-i18n = "4"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
-opener = "0.8.5"
+opener = { workspace = true }
+succession = { version = "0.2", features = ["supervision", "eviction"] }
+tracing-appender = "0.2.5"
 
-# Menu-bar status item (NSStatusItem) — the agent hosts the tray now. objc2
-# gives Retained<T>-owned AppKit bindings (no #99-style leaks); versions match
-# the GUI's so the resolve doesn't move the gpui Cargo.lock pin.
+# Held at the version Cargo.lock already has for gpui's own build-dependency;
+# bumping it independently would move the pinned gpui rev.
+[build-dependencies]
+embed-resource = "3.0.9"
+
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSResponder", "NSView", "NSMenu", "NSMenuItem", "NSImage", "NSApplication", "NSRunningApplication"] }
-objc2-foundation = { version = "0.3.2", features = ["NSString", "NSData", "NSArray"] }
-plist = "1.9.0"
+dispatch2 = "0.3.1"
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true, features = ["NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSResponder", "NSView", "NSMenu", "NSMenuItem", "NSImage", "NSApplication", "NSRunningApplication", "NSWorkspace"] }
+objc2-core-graphics = { workspace = true, features = ["CGDirectDisplay", "CGDisplayConfiguration", "libc"] }
+objc2-foundation = { workspace = true, features = ["NSString", "NSData", "NSArray", "NSNotification"] }
 
-# Autostart via the HKCU Run key (launch_agent.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55"
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

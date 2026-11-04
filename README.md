@@ -1,5 +1,5 @@
 > [!WARNING]
-> **OpenLogi is under active development** and not yet stable — features and config may still change. Give the repo a **Star** ⭐ and **Watch** 👀 it to get notified the moment a release lands.
+> **OpenLogi is under active development** and not yet stable — features and config may still change. Give the repo a **Star** ⭐ and **Watch** 👀 it to get notified when a new release lands.
 
 <h4 align="right"><strong>English</strong> | <a href="docs/README.zh-CN.md">简体中文</a> | <a href="docs/README.ja.md">日本語</a> | <a href="docs/README.de.md">Deutsch</a> | <a href="docs/README.fr.md">Français</a> | <a href="docs/README.ko.md">한국어</a></h4>
 
@@ -8,8 +8,7 @@
 </p>
 
 <h1 align="center">OpenLogi</h1>
-<p align="center"><strong>⚡️ A native, local-first alternative to Logitech Options+, written in Rust 🦀<br/>Remap buttons, DPI, and SmartShift over HID++. No account, no telemetry.</strong></p>
-
+<p align="center"><strong>⚡️ A native, local-first alternative to Logitech Options+, written in Rust 🦀<br/>Unlock the full capabilities of Logitech mice, keyboards, and webcams over HID++ and UVC</strong></p>
 
 <div align="center">
     <a href="https://twitter.com/AprilNEA" target="_blank">
@@ -25,76 +24,69 @@
 
 <p align="center">
     <a href="https://trendshift.io/repositories/42303" target="_blank">
-    <img src="https://trendshift.io/api/badge/trendshift/repositories/42303/daily?language=Rust" alt="AprilNEA%2FOpenLogi | Trendshift" width="250" height="55"/></a>
+    <img src="https://trendshift.io/api/badge/repositories/42303" alt="AprilNEA%2FOpenLogi | Trendshift" width="250" height="55"/></a>
+    <a href="https://www.producthunt.com/products/openlogi?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-openlogi" target="_blank" rel="noopener noreferrer">
+    <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=openlogi&amp;theme=dark&amp;period=daily">
+        <source media="(prefers-color-scheme: light)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=openlogi&amp;theme=light&amp;period=daily">
+        <img alt="OpenLogi - A local-first alternative to Logitech Options+ | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=openlogi&amp;theme=light&amp;period=daily">
+    </picture></a>
 </p>
 
-> **Options+ ? Try OpenLogi.**
+> **Fed up with Options+? Try OpenLogi.**
 
-Remap buttons, drive DPI and SmartShift, and switch profiles per app — without a Logitech account, telemetry, or the official Options+ install. No cloud, plain TOML config; the only network calls are device-image fetches and an opt-in, off-by-default update check.
+Runs on macOS, Linux, and Windows.
 
 ---
-
-## What it is
-
-OpenLogi talks to Logitech HID++ mice over a Logi Bolt receiver — or a
-Bluetooth-direct / wired connection — without running Logi Options+. It ships
-two binaries:
-
-- **[OpenLogi GUI](crates/openlogi-gui)** — a GPUI desktop app: an interactive mouse diagram with clickable hotspots, a per-button action picker (41 built-in actions plus custom keyboard shortcuts authored in the TOML config), DPI presets, a SmartShift panel (wheel mode, sensitivity, permanent ratchet), per-application profile overlays, a device carousel that switches between paired devices live, and a Settings window with a UI localized into 20 languages.
-- **[OpenLogi CLI](crates/openlogi-cli)** — a CLI for headless inventory (`list`) plus asset-sync and on-device diagnostic subcommands.
-
-Everything is local: bindings live in a plain TOML file, button presses are remapped through the OS event tap, and DPI / SmartShift changes are written straight to the device over HID++.
-
-macOS and Linux are supported. Windows is an early, untested preview — signed
-builds ship with each release; see [Roadmap](#roadmap).
 
 ## Beyond Options+
 
 Things OpenLogi does that Options+ won't:
 
-- **Run on Linux.** Options+ ships for macOS and Windows only. OpenLogi treats
-  Linux as a first-class platform: evdev/uinput hook, udev rules, a systemd
-  user unit, and `.deb` / `.rpm` packages.
-- **Move the Gesture Button.** Pick which physical button owns the gesture
-  role — the dedicated Gesture Button, middle, back, or forward — with per-direction swipe
-  bindings, or turn gestures off entirely. Options+ pins the gesture role to
-  the dedicated Gesture Button.
-- **Keep config in plain text.** Everything is one TOML file you can read,
-  diff, version-control, and copy between machines.
-- **Script it.** A real CLI: device inventory, asset prefetch, and on-device
-  HID++ diagnostics (feature dump, DPI / SmartShift round-trips).
-- **Stay light.** Native Rust + GPUI binaries — no Electron suite, no resident
-  updaters, no account, no telemetry.
+- **Stay light.** Native Rust + GPUI.
+- **Run on Linux.** Linux is a first-class platform in OpenLogi.
+- **Gestures on any button.** Give the gesture role to any physical button — or turn gestures off entirely.
+- **Plain-text config.** Everything is one TOML file you can sync between machines however you like.
+- **Script it.** A real CLI alongside the GUI.
 
-## Roadmap
+## Features
 
-| Capability | State |
-|---|---|
-| Discover Bolt receivers + list paired devices (CLI + GUI) | ✅ |
-| Unifying receivers (older protocol, replaced by Bolt) | ✅ |
-| Bluetooth-direct / wired devices (no receiver) | ✅ |
-| Battery percentage / charge state | ✅ (online devices) |
-| Interactive GUI: carousel, mouse diagram, action picker | ✅ macOS + Linux |
-| Button remapping via the OS event tap / evdev hook | ✅ macOS + Linux |
-| 41-action catalog + custom keyboard shortcuts (TOML-authored) | ✅ macOS + Linux¹ |
-| DPI control + presets + Cycle / Set-preset actions (HID++ `0x2201`) | ✅ |
-| SmartShift wheel: mode toggle + sensitivity + permanent-ratchet panel (HID++ `0x2111`) | ✅ |
-| Per-application profile overlays (auto-switch on app focus) | ✅ macOS, 🟡 Linux (X11 only) |
-| Settings window: launch-at-login, update check, menu-bar, permissions, language | ✅ macOS + Linux |
-| Interface localization (20 languages: da, de, el, en, es, fi, fr, it, ja, ko, nb, nl, pl, pt-BR, pt-PT, ru, sv, zh-CN, zh-HK, zh-TW) | ✅ |
-| Linux packaging: udev rules, systemd unit, `.deb` / `.rpm` | ✅ Linux |
-| Gesture-button per-direction bindings | 🟡 configurable; hardware capture pending |
-| Middle / mode-shift / thumbwheel button capture | 🟡 configurable; hook owns side buttons only |
-| Windows (agent, GUI, event hook) | 🟡 untested preview — signed `.exe` / `.msi` ship per release |
+- Devices connected over Logi Bolt receivers, Unifying receivers, Bluetooth, or a wired connection, with battery percentage and charge state
+- Button remapping via the OS input hook: a built-in action catalog plus custom keyboard shortcuts authored in the TOML config, including independent short/long-press actions and hold-until-release chords for push-to-talk¹
+- Per-application profile overlays that auto-switch on app focus (macOS + Windows; Linux on X11 / XWayland only)
+- Litra lights: power, brightness, and color temperature, with optional auto power that follows camera activity
 
-¹ Media key actions use D-Bus MPRIS on Linux; a handful of macOS-specific actions (e.g. Launchpad) have no Linux equivalent and are no-ops.
+**Mouse**
+
+- Capture and remap the middle, mode-shift, and thumbwheel buttons (middle everywhere, the rest where the device exposes them)
+- Per-direction gesture bindings with live capture, on any capable button
+- Actions Ring: a cursor-centred, eight-slot overlay of actions (`ShowActionsRing`), with per-application layouts
+- DPI control with presets and Cycle / Set-preset actions (`0x2201`)
+- SmartShift wheel: mode toggle, sensitivity, and a permanent-ratchet panel (`0x2111`)
+- Per-device native scroll inversion (`0x2121`, supported devices)
+
+**Keyboard**
+
+- Global F-key remapping: the same action catalog as the mouse, plus power-user actions — typed text, key combos, multi-step workflows (macOS + Windows)
+- Static RGB lighting (`0x8070` / `0x8080`, supported devices)
+
+**Camera**
+
+- Any Logitech UVC webcam (Brio, StreamCam, the C920 series, …), plug and play
+- Live preview that opens the camera only while you watch — leaving it releases the camera entirely and the LED goes off
+- Image controls written straight to the UVC hardware — zoom, focus, exposure, brightness, contrast, saturation, sharpness, white balance, tint, anti-flicker, and low-light compensation, with auto-mode toggles for focus / exposure / white balance — so changes apply in Meet / Zoom / OBS and every other app using the camera
+- One-click profiles: built-in Default / Streaming / Video call plus custom snapshots; settings persist per camera and are written back to the hardware on the next view
+
+¹ Media key actions use D-Bus MPRIS on Linux; a handful of macOS-specific actions have no universal Linux equivalent and are no-ops. Windows maps platform actions to native equivalents where available.
 
 ## Install
 
 > [!IMPORTANT]
-> Quit **Logi Options+** first — the two applications fight over HID++ access and only one can own a given receiver at a time.
+> Quit **Logi Options+** first: the two applications fight over HID++ access, and only one can own a given receiver at a time.
 
 ### macOS
+
+Requires macOS 13 or later.
 
 Download the signed, notarized `.dmg` from the [latest release](https://github.com/AprilNEA/OpenLogi/releases/latest) and drag `OpenLogi.app` to `/Applications`.
 
@@ -118,7 +110,8 @@ before the official cask autobump lands. Install either `openlogi` or
 
 ### Linux
 
-Download the `.deb` or `.rpm` from the [latest release](https://github.com/AprilNEA/OpenLogi/releases/latest):
+Download the package for your distribution from the
+[latest release](https://github.com/AprilNEA/OpenLogi/releases/latest):
 
 ```sh
 # Debian / Ubuntu
@@ -126,27 +119,66 @@ sudo dpkg -i openlogi_*.deb
 
 # Fedora / RHEL
 sudo rpm -i openlogi-*.rpm
+
+# Arch Linux
+sudo pacman -U openlogi-*.pkg.tar.zst
 ```
 
 Packages are published for both `x86_64`/`amd64` and `arm64`/`aarch64`.
+Pre-built packages require GLIBC 2.35 or newer (Ubuntu 22.04 baseline).
 
-The package installs udev rules that grant your user access to
-`/dev/hidraw*` and `/dev/uinput` without `sudo`. After installation,
-enable the background agent for your user:
+NixOS users can instead import the repository's module, which installs the
+package and udev rules and starts the agent with the graphical session:
+
+```nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.openlogi = {
+    url = "github:AprilNEA/OpenLogi";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { nixpkgs, openlogi, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux"; # or aarch64-linux
+      modules = [
+        openlogi.nixosModules.default
+        { programs.openlogi.enable = true; }
+      ];
+    };
+  };
+}
+```
+
+All Linux packages install udev rules that grant your user access to
+`/dev/hidraw*`, `/dev/uinput` and your Logitech mouse's `/dev/input/event*`
+node without `sudo`. The NixOS module starts the agent automatically; after a
+`.deb`, `.rpm`, or `.pkg.tar.zst` installation, enable it for your user:
 
 ```sh
 systemctl --user enable --now openlogi-agent.service
 ```
 
-See [docs/INSTALL-linux.md](docs/INSTALL-linux.md) for manual / source installs
-and distros without systemd.
+See [docs/INSTALL-linux.md](docs/INSTALL-linux.md) for complete NixOS options,
+manual / source installs, and distros without systemd.
 
-### Windows (preview)
+### Windows
 
-Signed `.exe` and per-user `.msi` installers (x86_64 and arm64) are attached to
-each release. Windows support is an early preview that hasn't been broadly
-tested on real hardware yet — expect rough edges, and please
-[report issues](https://github.com/AprilNEA/OpenLogi/issues).
+Signed portable `.zip` archives and per-user `.msi` installers (x86_64 and
+arm64) are attached to each release. Both ship the GUI (`OpenLogi.exe`)
+together with the background agent (`openlogi-agent.exe`), which owns all
+device I/O. Keep the two files side by side when using the portable zip, or
+the GUI has nothing to connect to.
+
+Windows support has been validated end-to-end on Windows 11 with real
+hardware (a wired keyboard and a Unifying-receiver mouse), including
+install, in-place upgrade, and uninstall of the MSI. It is newer than the
+macOS build, so if you hit a rough edge please
+[report it](https://github.com/AprilNEA/OpenLogi/issues). The agent shows a
+system-tray icon (Show Main Window / Quit) so the app stays reachable after
+the main window is closed. To disable it on Windows, set
+`show_in_menu_bar = false` in the TOML `[app_settings]` block and restart the
+agent; the GUI toggle is currently macOS-only.
 
 To build from source, see [DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
@@ -165,23 +197,30 @@ See [DEVELOPMENT.md](docs/DEVELOPMENT.md)
 
 ## Acknowledgments
 
-- [`hidpp`](https://crates.io/crates/hidpp) by [@lus](https://github.com/lus)
-- [Solaar](https://github.com/pwr-Solaar/Solaar)
-- [Mouser](https://github.com/TomBadash/Mouser) by Tom Badash
+- **Windows, cameras, and i18n** by [@davidbudnick](https://github.com/davidbudnick) — keyboard RGB, Windows support, Logitech webcam support
+- **Linux port** by [@cserby](https://github.com/cserby) — Linux support
+- [Solaar](https://github.com/pwr-Solaar/Solaar) by [@pwr](https://github.com/pwr) — open-source HID++ implementation
+- [Mouser](https://github.com/TomBadash/Mouser) by [@TomBadash](https://github.com/TomBadash) — a local, account-free Options+ replacement
 
 ## License
 
-Dual-licensed under either of
+The code in this repository is dual-licensed under either of
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
 
+### Third-party code
+
+`crates/openlogi-hidpp` is a vendored fork of [`hidpp`](https://crates.io/crates/hidpp)
+by [@lus](https://github.com/lus), licensed 0BSD.
+
 ### Logo & brand assets
 
-The OpenLogi logo and app icon — the brand assets under [`design/`](design/) —
-are © 2026 AprilNEA, all rights reserved, and are not covered by the MIT/Apache
+Thanks to [@kubai087](https://github.com/kubai087) for designing the OpenLogi
+logo. The OpenLogi logo and app icon (the brand assets under
+[`design/`](design/)) are © 2026 AprilNEA, all rights reserved, and are not covered by the MIT/Apache
 licenses above; see [`design/LICENSE`](design/LICENSE). Forking the code grants
 no right to the OpenLogi name, logo, or icon; please don't use them to represent
 your own projects, forks, or distributions without prior written permission.
@@ -192,4 +231,4 @@ your own projects, forks, or distributions without prior written permission.
 
 ## Repo activity
 
-![Repobeats analytics image](https://repobeats.axiom.co/api/embed/4a0b576a03e9d528ad31ccf4797a1286c045d021.svg "Repobeats analytics image")
+![Repobeats analytics image](https://repobeats.com/AprilNEA/OpenLogi "Repobeats analytics image")

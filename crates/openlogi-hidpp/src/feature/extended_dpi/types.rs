@@ -326,10 +326,10 @@ pub(super) fn parse_dpi_ranges(stream: &[u8]) -> Result<Vec<DpiRange>, Hidpp20Er
             offset += 4;
         } else {
             // A literal value: flush the previous standalone literal first.
-            if let Some(previous) = pending {
-                if !pending_is_range_end {
-                    ranges.push(DpiRange::Fixed(previous));
-                }
+            if let Some(previous) = pending
+                && !pending_is_range_end
+            {
+                ranges.push(DpiRange::Fixed(previous));
             }
             pending = Some(value);
             pending_is_range_end = false;
@@ -337,10 +337,10 @@ pub(super) fn parse_dpi_ranges(stream: &[u8]) -> Result<Vec<DpiRange>, Hidpp20Er
         }
     }
 
-    if let Some(previous) = pending {
-        if !pending_is_range_end {
-            ranges.push(DpiRange::Fixed(previous));
-        }
+    if let Some(previous) = pending
+        && !pending_is_range_end
+    {
+        ranges.push(DpiRange::Fixed(previous));
     }
 
     if ranges.is_empty() {
@@ -351,7 +351,7 @@ pub(super) fn parse_dpi_ranges(stream: &[u8]) -> Result<Vec<DpiRange>, Hidpp20Er
 
 /// Parses a `getSensorDpiList` payload (after the echoed sensor index and
 /// direction) into explicit DPI values, stopping at the `0x0000` terminator.
-pub(super) fn parse_dpi_list(bytes: &[u8]) -> Result<Vec<u16>, Hidpp20Error> {
+pub(super) fn parse_dpi_list(bytes: &[u8]) -> Vec<u16> {
     let mut values = Vec::new();
     let mut offset = 0;
     while offset + 1 < bytes.len() {
@@ -362,7 +362,7 @@ pub(super) fn parse_dpi_list(bytes: &[u8]) -> Result<Vec<u16>, Hidpp20Error> {
         values.push(value);
         offset += 2;
     }
-    Ok(values)
+    values
 }
 
 /// Parses the first `count` lift-off-distance entries of a `getSensorLodList`
