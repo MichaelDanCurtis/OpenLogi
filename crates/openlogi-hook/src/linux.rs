@@ -28,7 +28,7 @@ use x11rb::properties::WmClass;
 use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt as _, Window};
 use x11rb::rust_connection::RustConnection;
 
-use crate::{ButtonId, EventDisposition, HookError, MouseEvent};
+use crate::{ButtonId, EventDisposition, HookError, HookEvent, MouseEvent};
 
 /// Name stamped on every uinput pass-through device; used to skip those
 /// devices during enumeration so we don't hook our own virtual mice.
@@ -46,7 +46,7 @@ pub(crate) struct HookInner {
 }
 
 pub(crate) fn start(
-    cb: impl Fn(MouseEvent) -> EventDisposition + Send + Sync + 'static,
+    cb: impl Fn(HookEvent) -> EventDisposition + Send + Sync + 'static,
 ) -> Result<HookInner, HookError> {
     let devices = find_mouse_devices();
     if devices.is_empty() {
@@ -54,7 +54,7 @@ pub(crate) fn start(
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let cb: Arc<dyn Fn(MouseEvent) -> EventDisposition + Send + Sync> = Arc::new(cb);
+    let cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync> = Arc::new(cb);
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(devices.len());
     let mut stop_pipes: Vec<OwnedFd> = Vec::with_capacity(devices.len());
 
@@ -244,8 +244,10 @@ fn translate(event: &evdev::InputEvent, hires_scroll: bool) -> Option<MouseEvent
                 delta_y: value,
             }),
             _ => {
-                #[allow(clippy::cast_precision_loss)]
-                // scroll deltas fit comfortably in f32 mantissa
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "scroll deltas fit comfortably in the f32 mantissa"
+                )]
                 let v = value as f32;
                 if hires_scroll {
                     match axis {
@@ -286,13 +288,15 @@ fn key_to_button(key: KeyCode) -> Option<ButtonId> {
     }
 }
 
-// All params are owned: path/cb/stop/stop_rx are moved into the thread and must not be refs.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "path/cb/stop/stop_rx are moved into the spawned thread and must not be refs"
+)]
 fn device_thread(
     path: std::path::PathBuf,
     mut device: Device,
     mut virtual_device: VirtualDevice,
-    cb: Arc<dyn Fn(MouseEvent) -> EventDisposition + Send + Sync>,
+    cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync>,
     stop: Arc<AtomicBool>,
     stop_rx: OwnedFd,
 ) {
@@ -356,7 +360,7 @@ fn device_thread(
                 }
             } else {
                 let disposition = match translate(&event, hires_scroll) {
-                    Some(me) => cb(me),
+                    Some(me) => cb(HookEvent::Mouse(me)),
                     // Low-res companions (REL_WHEEL/REL_HWHEEL) must be suppressed when hi-res
                     // is active — passing them through would double the scroll distance.
                     None if hires_scroll
@@ -455,6 +459,8 @@ pub(crate) fn frontmost_bundle_id() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use evdev::{EventType, InputEvent, KeyCode, RelativeAxisCode};
 
     use super::*;
@@ -493,61 +499,61 @@ mod tests {
     #[test]
     fn translate_btn_left_down_returns_button_pressed() {
         let event = InputEvent::new(EventType::KEY.0, KeyCode::BTN_LEFT.0, 1);
-        assert!(matches!(
+        assert_matches!(
             translate(&event, false),
             Some(MouseEvent::Button {
                 id: ButtonId::LeftClick,
                 pressed: true
             })
-        ));
+        );
     }
 
     #[test]
     fn translate_btn_left_up_returns_button_released() {
         let event = InputEvent::new(EventType::KEY.0, KeyCode::BTN_LEFT.0, 0);
-        assert!(matches!(
+        assert_matches!(
             translate(&event, false),
             Some(MouseEvent::Button {
                 id: ButtonId::LeftClick,
                 pressed: false
             })
-        ));
+        );
     }
 
     #[test]
     fn translate_btn_back_returns_back() {
         let event = InputEvent::new(EventType::KEY.0, KeyCode::BTN_BACK.0, 1);
-        assert!(matches!(
+        assert_matches!(
             translate(&event, false),
             Some(MouseEvent::Button {
                 id: ButtonId::Back,
                 pressed: true
             })
-        ));
+        );
     }
 
     #[test]
     fn translate_btn_side_returns_back() {
         let event = InputEvent::new(EventType::KEY.0, KeyCode::BTN_SIDE.0, 1);
-        assert!(matches!(
+        assert_matches!(
             translate(&event, false),
             Some(MouseEvent::Button {
                 id: ButtonId::Back,
                 pressed: true
             })
-        ));
+        );
     }
 
     #[test]
     fn translate_btn_forward_returns_forward() {
         let event = InputEvent::new(EventType::KEY.0, KeyCode::BTN_FORWARD.0, 1);
-        assert!(matches!(
+        assert_matches!(
             translate(&event, false),
             Some(MouseEvent::Button {
                 id: ButtonId::Forward,
                 pressed: true
             })
-        ));
+        );
     }
 
     // ── movement ─────────────────────────────────────────────────────────────
@@ -555,25 +561,25 @@ mod tests {
     #[test]
     fn translate_rel_x_returns_horizontal_move() {
         let event = InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, 7);
-        assert!(matches!(
+        assert_matches!(
             translate(&event, false),
             Some(MouseEvent::Moved {
                 delta_x: 7,
                 delta_y: 0
             })
-        ));
+        );
     }
 
     #[test]
     fn translate_rel_y_returns_vertical_move() {
         let event = InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, -4);
-        assert!(matches!(
+        assert_matches!(
             translate(&event, false),
             Some(MouseEvent::Moved {
                 delta_x: 0,
                 delta_y: -4
             })
-        ));
+        );
     }
 
     // ── scroll — standard ────────────────────────────────────────────────────

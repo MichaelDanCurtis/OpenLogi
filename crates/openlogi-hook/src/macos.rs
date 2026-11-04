@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
@@ -12,18 +13,27 @@ use core_foundation::runloop::{
 };
 use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::event::{
-    CGEvent, CGEventField, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
-    CGEventTapProxy, CGEventType, CallbackResult, EventField,
+    CGEvent, CGEventField, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
+    CGEventTapPlacement, CGEventTapProxy, CGEventType, CallbackResult, EventField,
 };
 use foreign_types_shared::ForeignType as _;
 use tracing::{debug, error, warn};
 
-use crate::{ButtonId, EventDevice, EventDisposition, HookError, MouseEvent};
+use crate::{
+    ButtonId, EventDevice, EventDisposition, EventTapInfo, HookError, HookEvent, KeyEvent,
+    KeyModifiers, MouseEvent, TapLocation,
+};
 
 /// Everything `Hook` needs to control the background thread.
 pub(crate) struct HookInner {
     thread: thread::JoinHandle<()>,
     run_loop: CFRunLoop,
+    /// Termination flag, re-checked at the top of every run-loop slice.
+    /// `run_loop.stop()` only interrupts the loop while it is *inside* a
+    /// `run_in_mode` slice; a stop landing in the gap between slices is
+    /// dropped, so this flag — not the CF stop alone — is the reliable
+    /// shutdown signal that guarantees the thread can never hang forever.
+    stop: Arc<AtomicBool>,
 }
 
 // SAFETY: CFRunLoop is a Core Foundation ref-counted object. The CF
@@ -252,6 +262,36 @@ fn button_number_to_id(n: i64) -> Option<ButtonId> {
     }
 }
 
+/// Map the macOS modifier flags on a `CGEvent` to our [`KeyModifiers`].
+/// `SecondaryFn` is deliberately ignored: it is firmware-internal and
+/// unreliable as a trigger (function-key-remapper spec, Appendix A).
+fn modifiers_from_flags(flags: CGEventFlags) -> KeyModifiers {
+    KeyModifiers {
+        shift: flags.contains(CGEventFlags::CGEventFlagShift),
+        control: flags.contains(CGEventFlags::CGEventFlagControl),
+        option: flags.contains(CGEventFlags::CGEventFlagAlternate),
+        command: flags.contains(CGEventFlags::CGEventFlagCommand),
+    }
+}
+
+/// Translate a keyboard `CGEvent` into a [`KeyEvent`]. Returns `None` for
+/// non-key event types (the mouse path handles those) and for `FlagsChanged`
+/// (modifier state rides on the next key event via its flags; a standalone
+/// flags change carries no key of interest to the remapper).
+fn translate_key(etype: CGEventType, event: &CGEvent) -> Option<KeyEvent> {
+    let pressed = match etype {
+        CGEventType::KeyDown => true,
+        CGEventType::KeyUp => false,
+        // FlagsChanged: no key to remap here.
+        _ => return None,
+    };
+    Some(KeyEvent {
+        keycode: event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16,
+        pressed,
+        modifiers: modifiers_from_flags(event.get_flags()),
+    })
+}
+
 /// Convert a `CGEvent` to our [`MouseEvent`] vocabulary. Returns `None`
 /// for event types we don't translate (e.g. move events, unknown buttons).
 fn translate(etype: CGEventType, event: &CGEvent) -> Option<MouseEvent> {
@@ -410,7 +450,7 @@ fn usable_scroll_delta(event: &CGEvent, axis: ScrollAxisFields) -> f64 {
 
 /// Create the event tap and run loop on a dedicated thread.
 pub(crate) fn start(
-    cb: impl Fn(MouseEvent) -> EventDisposition + Send + Sync + 'static,
+    cb: impl Fn(HookEvent) -> EventDisposition + Send + Sync + 'static,
 ) -> Result<HookInner, HookError> {
     if !has_accessibility() {
         return Err(HookError::AccessibilityDenied);
@@ -418,14 +458,18 @@ pub(crate) fn start(
 
     // Wrap in Arc so the closure handed to CGEventTap::new captures it by
     // clone rather than by move — avoids a second Box allocation.
-    let cb: Arc<dyn Fn(MouseEvent) -> EventDisposition + Send + Sync> = Arc::new(cb);
+    let cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync> = Arc::new(cb);
 
+    let stop = Arc::new(AtomicBool::new(false));
     let (rl_tx, rl_rx) = mpsc::channel::<CFRunLoop>();
 
-    let thread = thread::Builder::new()
-        .name("openlogi-hook".into())
-        .spawn(move || thread_main(cb, rl_tx))
-        .map_err(|e| HookError::MacOsTap(e.to_string()))?;
+    let thread = {
+        let stop = Arc::clone(&stop);
+        thread::Builder::new()
+            .name("openlogi-hook".into())
+            .spawn(move || thread_main(cb, rl_tx, stop))
+            .map_err(|e| HookError::MacOsTap(e.to_string()))?
+    };
 
     // Block until the background thread confirms the run loop is live, or
     // reports failure by dropping its sender.
@@ -437,7 +481,11 @@ pub(crate) fn start(
         )
     })?;
 
-    Ok(HookInner { thread, run_loop })
+    Ok(HookInner {
+        thread,
+        run_loop,
+        stop,
+    })
 }
 
 /// Body of the background hook thread.
@@ -446,8 +494,9 @@ pub(crate) fn start(
     reason = "rl_tx must be owned: dropping it signals the parent's recv() to return Err on failure paths"
 )]
 fn thread_main(
-    cb: Arc<dyn Fn(MouseEvent) -> EventDisposition + Send + Sync>,
+    cb: Arc<dyn Fn(HookEvent) -> EventDisposition + Send + Sync>,
     rl_tx: mpsc::Sender<CFRunLoop>,
+    stop: Arc<AtomicBool>,
 ) {
     let event_types = vec![
         CGEventType::LeftMouseDown,
@@ -465,6 +514,11 @@ fn thread_main(
         CGEventType::LeftMouseDragged,
         CGEventType::RightMouseDragged,
         CGEventType::OtherMouseDragged,
+        // Keyboard capture for the function-key remapper. Esc/F1-F19
+        // arrive here (proven: F1 = keycode 0x7A + SecondaryFn flag).
+        CGEventType::KeyDown,
+        CGEventType::KeyUp,
+        CGEventType::FlagsChanged,
     ];
 
     let tap_result = CGEventTap::new(
@@ -473,10 +527,17 @@ fn thread_main(
         CGEventTapOptions::Default,
         event_types,
         move |_proxy: CGEventTapProxy, etype: CGEventType, event: &CGEvent| {
-            let Some(mouse_event) = translate(etype, event) else {
+            // Try the mouse path first, then the keyboard path; whichever
+            // yields a translation wins. A given event type is one or the
+            // other, never both.
+            let hook_event = if let Some(mouse_event) = translate(etype, event) {
+                HookEvent::Mouse(mouse_event)
+            } else if let Some(key_event) = translate_key(etype, event) {
+                HookEvent::Key(key_event)
+            } else {
                 return CallbackResult::Keep;
             };
-            match cb(mouse_event) {
+            match cb(hook_event) {
                 EventDisposition::PassThrough => CallbackResult::Keep,
                 EventDisposition::Suppress => CallbackResult::Drop,
             }
@@ -515,9 +576,19 @@ fn thread_main(
     // *entire* system input stream — mouse and keyboard alike — until
     // reboot. If the user revokes access while we're live, tear the tap
     // down right here, on the tap's own thread, so input is restored even
-    // when the UI thread is already stuck. `stop()` (normal shutdown)
-    // returns `Stopped` and also breaks the loop.
+    // when the UI thread is already stuck.
+    //
+    // `stop()` requests shutdown two ways: it sets `stop` and calls
+    // `run_loop.stop()`. The CF stop returns `Stopped` and breaks promptly
+    // while a slice is running, but is a no-op if it lands in the gap
+    // between slices (CFRunLoopStop only acts on a running loop). The `stop`
+    // flag, checked at the top of every slice, is the reliable signal: in
+    // that race the thread notices one 500 ms slice later instead of joining
+    // forever.
     loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         match CFRunLoop::run_in_mode(
             // SAFETY: framework-provided static CFStringRef, 'static.
             unsafe { kCFRunLoopDefaultMode },
@@ -563,8 +634,118 @@ fn disable_tap(tap: &CGEventTap) {
     unsafe { CGEventTapEnable(tap.mach_port().as_concrete_TypeRef(), false) };
 }
 
+/// Mirror of CoreGraphics' `CGEventTapInformation`. `#[repr(C)]` reproduces the
+/// header layout (including the padding before `events_of_interest` and
+/// `min_usec_latency`) so `CGGetEventTapList` writes into the right offsets.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "events_of_interest and the latency floats are unread but must \
+              exist so the struct keeps CoreGraphics' exact 48-byte stride; \
+              CGGetEventTapList writes whole records into the buffer"
+)]
+struct CGEventTapInformation {
+    event_tap_id: u32,
+    tap_point: u32,
+    options: u32,
+    events_of_interest: u64,
+    tapping_process: i32,
+    process_being_tapped: i32,
+    enabled: bool,
+    min_usec_latency: f32,
+    avg_usec_latency: f32,
+    max_usec_latency: f32,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    // `core-graphics` doesn't bind the enumeration side (it ships the tap
+    // *create/enable* path only), so we declare it ourselves. Passing a null
+    // list with count 0 returns the number of taps via `event_tap_count`.
+    fn CGGetEventTapList(
+        max_number_of_taps: u32,
+        tap_list: *mut CGEventTapInformation,
+        event_tap_count: *mut u32,
+    ) -> i32;
+}
+
+#[link(name = "System", kind = "dylib")]
+unsafe extern "C" {
+    // libproc; resolves a PID to its executable path. Returns the byte length
+    // written, or <= 0 on failure (e.g. the process exited, or it's out of the
+    // caller's permission scope).
+    fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_void, buffersize: u32) -> i32;
+}
+
+/// See [`super::Hook::list_event_taps`].
+pub(crate) fn list_event_taps() -> Vec<EventTapInfo> {
+    let mut count: u32 = 0;
+    // SAFETY: a null `tap_list` with `max == 0` is the documented count-probe
+    // form; it only writes `count`.
+    let err = unsafe { CGGetEventTapList(0, std::ptr::null_mut(), &raw mut count) };
+    if err != 0 || count == 0 {
+        return Vec::new();
+    }
+
+    // SAFETY: `CGEventTapInformation` is a plain `repr(C)` POD; an all-zero bit
+    // pattern is a valid instance (`enabled = false`, all numeric fields 0).
+    // `CGGetEventTapList` overwrites each slot it fills.
+    let mut taps: Vec<CGEventTapInformation> = vec![unsafe { std::mem::zeroed() }; count as usize];
+    let err = unsafe { CGGetEventTapList(count, taps.as_mut_ptr(), &raw mut count) };
+    if err != 0 {
+        return Vec::new();
+    }
+    // The second call may report fewer taps than the probe; never read past it.
+    taps.truncate(count as usize);
+
+    taps.into_iter()
+        .map(|t| EventTapInfo {
+            tap_id: t.event_tap_id,
+            location: match t.tap_point {
+                0 => TapLocation::Hid,
+                1 => TapLocation::Session,
+                2 => TapLocation::AnnotatedSession,
+                other => TapLocation::Other(other),
+            },
+            // kCGEventTapOptionDefault == 0 (active); kCGEventTapOptionListenOnly == 1.
+            active: t.options == 0,
+            enabled: t.enabled,
+            owner_pid: t.tapping_process,
+            owner_name: process_name(t.tapping_process),
+            target_pid: (t.process_being_tapped != 0).then_some(t.process_being_tapped),
+        })
+        .collect()
+}
+
+/// Best-effort PID → executable file name via libproc.
+fn process_name(pid: i32) -> Option<String> {
+    // PROC_PIDPATHINFO_MAXSIZE is 4 * MAXPATHLEN (4 * 1024).
+    const BUF_LEN: u32 = 4096;
+    if pid <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; BUF_LEN as usize];
+    // SAFETY: `buf` is a live, writable buffer of `BUF_LEN` bytes; the C side
+    // writes at most that many and returns the length actually written.
+    let len = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), BUF_LEN) };
+    if len <= 0 {
+        return None;
+    }
+    // `len > 0` here, so `unsigned_abs` is the value itself; widening to usize
+    // is lossless and sidesteps the sign-loss cast lint.
+    buf.truncate(len.unsigned_abs() as usize);
+    let path = String::from_utf8_lossy(&buf);
+    Some(path.rsplit('/').next().unwrap_or(&path).to_string())
+}
+
 /// Signal the run loop to stop and join the background thread.
 pub(crate) fn stop(inner: HookInner) {
+    // Set the flag *before* waking the loop: if `run_loop.stop()` lands in
+    // the gap between slices and is dropped, the thread still observes the
+    // flag at the next slice top. Relaxed suffices — the flag carries no
+    // other data, and `thread.join()` below is the final synchronisation.
+    inner.stop.store(true, Ordering::Relaxed);
     inner.run_loop.stop();
     if let Err(e) = inner.thread.join() {
         error!("hook thread panicked on shutdown: {e:?}");
