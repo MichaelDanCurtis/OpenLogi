@@ -36,3 +36,4 @@ devenv.local.yaml
 
 # Packaging output.
 *.dmg
+.superpowers/
