@@ -11,7 +11,17 @@ openlogi diag controls        # dump reprogrammable controls and capability flag
 openlogi diag dpi             # read → write → read-back → restore DPI (smoke test)
 openlogi diag smartshift      # toggle SmartShift and restore (smoke test)
 openlogi diag lighting ff0000 # solid colour for a wired RGB keyboard (any RRGGBB hex)
+openlogi host list            # each keyboard's Easy-Switch slots: current, paired, host names
+openlogi host list --json     # the same, machine-readable
+openlogi host switch 2        # move the keyboard (and linked mice) to slot 2
 ```
+
+`openlogi host` talks to the running agent (exit status 4 when none answers).
+`list` exits 3 when no keyboard matched, in both `--json` and table output.
+`switch` fires the keyboard's `host_switch_actions` for that slot exactly as a
+key press would, exits 0 when switched or already there, 2 when the slot is
+unpaired or invalid, and 3 when no online keyboard matched. With more than one
+online keyboard, pass `--device <name>`.
 
 Running `openlogi` with no subcommand defaults to `list`. Set
 `OPENLOGI_LOG=debug` for verbose tracing in the CLI, GUI, or agent.

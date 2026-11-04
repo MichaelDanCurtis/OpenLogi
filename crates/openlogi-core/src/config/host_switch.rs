@@ -62,8 +62,7 @@ impl HostSwitchActions {
 pub enum HostSwitchTrigger {
     /// The keyboard's own host key was pressed.
     Key,
-    /// Reserved for a future software-initiated switch (`openlogi host
-    /// switch`); nothing on this branch constructs it yet.
+    /// A software-initiated switch (`openlogi host switch` over IPC).
     Command,
     /// The keyboard connected to this host.
     Arrive,

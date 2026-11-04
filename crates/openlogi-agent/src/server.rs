@@ -15,9 +15,11 @@ use openlogi_agent_core::hardware;
 use openlogi_agent_core::observable::ObservableState;
 use openlogi_agent_core::orchestrator::{Orchestrator, SharedRuntime};
 use openlogi_agent_core::runtime::ActionDispatcher;
+use openlogi_agent_core::watchers::host_switch::HostSwitchCommand;
 use openlogi_core::binding::ActionRingSlot;
 use openlogi_core::config::{Config, Lighting};
 use openlogi_core::device::DeviceInventory;
+use openlogi_core::hid::{HostSlots, HostSwitchCommandError, HostSwitchOutcome};
 use openlogi_hid::{
     DeviceRoute, Dpi, DpiInfo, HapticWaveform, HidppOperation, LightCommand, ReceiverSelector,
     SmartShiftStatus, WriteError,
@@ -25,10 +27,11 @@ use openlogi_hid::{
 use openlogi_ipc::transport;
 use openlogi_ipc::{
     ActionRingCommandError, ActionRingInvocation, Agent, AgentSnapshot, AgentStatus, ClientKind,
-    ConfigReloadError, Generation, Identity, MonitorEvent, Observation, PROTOCOL_VERSION,
-    PairingCommandError, PairingUpdate, RingObservation,
+    ConfigReloadError, Generation, HOST_SWITCH_BUDGET, Identity, MonitorEvent, Observation,
+    PROTOCOL_VERSION, PairingCommandError, PairingUpdate, RingObservation,
 };
 use succession::Compat;
+use tokio::sync::oneshot;
 
 use crate::pairing::PairingManager;
 // Brings `Listener::accept` into scope for the concrete listener `transport::bind`
@@ -322,6 +325,47 @@ impl Agent for AgentServer {
 
     async fn action_ring_cancel(self, _: Context, session_id: u64) {
         self.action_ring.cancel(session_id);
+    }
+
+    async fn host_slots(self, _: Context, route: DeviceRoute) -> Result<HostSlots, WriteError> {
+        self.shared
+            .device(&route)
+            .run(HidppOperation::ReadHostSlots, |c| async move {
+                openlogi_hid::read_host_slots_on(&c).await
+            })
+            .await
+    }
+
+    async fn switch_host(
+        self,
+        _: Context,
+        keyboard: DeviceRoute,
+        slot: u8,
+    ) -> Result<HostSwitchOutcome, HostSwitchCommandError> {
+        // The wire carries the 1-based slot people see; the watcher speaks
+        // HID++ host indexes.
+        let host = slot
+            .checked_sub(1)
+            .ok_or(HostSwitchCommandError::InvalidSlot)?;
+        let (reply, outcome) = oneshot::channel();
+        self.shared
+            .host_switch_commands
+            .send(HostSwitchCommand {
+                keyboard,
+                host,
+                reply,
+            })
+            .map_err(|_| HostSwitchCommandError::Busy)?;
+        match tokio::time::timeout(HOST_SWITCH_BUDGET, outcome).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(HostSwitchCommandError::Io(
+                "the host switch watcher dropped the request".into(),
+            )),
+            Err(_) => Err(HostSwitchCommandError::Io(format!(
+                "the host switch did not complete within {}s",
+                HOST_SWITCH_BUDGET.as_secs()
+            ))),
+        }
     }
 }
 

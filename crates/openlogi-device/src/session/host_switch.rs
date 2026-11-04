@@ -38,6 +38,10 @@ pub enum HostSwitchStopReason {
     Graceful,
     /// The keyboard disappeared, so only local resources can be released.
     DeviceLost,
+    /// Software asked for a switch to this 0-based host: the session restores
+    /// the diverted controls and completes exactly as if that host key had
+    /// been pressed.
+    Requested(u8),
 }
 
 const HOST_CONTROL_IDS: [(reprog_controls::ControlId, u8); 3] = [
@@ -96,6 +100,14 @@ pub enum HostSwitchError {
     HostSlotEmpty {
         /// The zero-based host slot that has no pairing.
         host: u8,
+    },
+    /// The requested host slot is outside the device's host count.
+    #[error("host {host} is outside the device's {host_count} host slots")]
+    InvalidHost {
+        /// The zero-based host slot that was requested.
+        host: u8,
+        /// How many host slots the device reports.
+        host_count: u8,
     },
 }
 
@@ -158,9 +170,10 @@ pub async fn run_host_switch_session(
         "host switch link active"
     );
     let outcome = tokio::select! {
-        reason = shutdown => {
-            let reason = reason.unwrap_or(HostSwitchStopReason::DeviceLost);
-            (None, reason == HostSwitchStopReason::Graceful)
+        reason = shutdown => match reason {
+            Ok(HostSwitchStopReason::Requested(host)) => (Some(host), true),
+            Ok(HostSwitchStopReason::Graceful) => (None, true),
+            Ok(HostSwitchStopReason::DeviceLost) | Err(_) => (None, false),
         },
         Some(host) = press_rx.recv() => (Some(host), true),
     };
@@ -492,9 +505,10 @@ fn host_change_required(
     requested_host: u8,
 ) -> Result<bool, HostSwitchError> {
     if requested_host >= host_count {
-        return Err(HostSwitchError::Hidpp(format!(
-            "host {requested_host} is outside device host count {host_count}"
-        )));
+        return Err(HostSwitchError::InvalidHost {
+            host: requested_host,
+            host_count,
+        });
     }
     Ok(current_host != requested_host)
 }
@@ -832,10 +846,13 @@ mod tests {
 
     #[test]
     fn host_outside_device_range_is_rejected() {
-        assert!(
-            host_change_required(0, 2, 2).is_err(),
-            "host 2 is outside a device that reports 2 hosts and must be rejected"
-        );
+        assert!(matches!(
+            super::host_change_required(0, 2, 2),
+            Err(super::HostSwitchError::InvalidHost {
+                host: 2,
+                host_count: 2
+            })
+        ));
     }
 
     #[test]

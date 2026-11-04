@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use openlogi_core::binding::Action;
 use openlogi_core::config::{HostSwitchActions, HostSwitchTrigger};
+use openlogi_core::hid::{HostSwitchCommandError, HostSwitchOutcome};
 use openlogi_hid::{
-    ChannelPool, DeviceIoGate, DeviceRoute, HostSwitchStopReason, run_host_switch_session,
-    switch_linked_hosts_with,
+    ChannelPool, DeviceIoGate, DeviceRoute, HostSwitchError, HostSwitchStopReason,
+    run_host_switch_session, switch_linked_hosts_with,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -37,6 +38,32 @@ pub struct HostSwitchLink {
 /// Read-only, lossless, coalescing view of resolved links.
 pub type HostSwitchLinks = watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>;
 
+/// A software-initiated host switch, answered once applied or refused.
+pub struct HostSwitchCommand {
+    /// The keyboard to move.
+    pub keyboard: DeviceRoute,
+    /// 0-based HID++ host index to move to.
+    pub host: u8,
+    /// Where the outcome goes; dropped by a caller that stopped waiting.
+    pub reply: oneshot::Sender<Result<HostSwitchOutcome, HostSwitchCommandError>>,
+}
+
+/// Sender half handed to the IPC server through `SharedRuntime`.
+pub type HostSwitchCommands = mpsc::UnboundedSender<HostSwitchCommand>;
+
+/// A parked software-initiated switch: parked only after a stop reason was
+/// sent to session `generation`, and answered exactly once by that
+/// generation's completion — whether it arrives through the normal
+/// found-in-`state.sessions` path, or, if that session was swept out first
+/// (another keyboard's completion ran [`stop_all`], or a reconcile removed
+/// it), through [`handle_completion`]'s not-found branch. Keyed by
+/// `generation` rather than the keyboard route so a same-keyboard session
+/// spawned after this one was stopped can never be mistaken for it.
+struct PendingCommand {
+    generation: u64,
+    reply: oneshot::Sender<Result<HostSwitchOutcome, HostSwitchCommandError>>,
+}
+
 /// Spawn the host switch session manager.
 pub fn spawn(
     links: &HostSwitchLinks,
@@ -44,6 +71,7 @@ pub fn spawn(
     receiver_access: ReceiverAccess,
     device_io: DeviceIoGate,
     dispatcher: ActionDispatcher,
+    commands: mpsc::UnboundedReceiver<HostSwitchCommand>,
 ) {
     let links = links.clone();
     let receiver_requests = receiver_access.subscribe_requests();
@@ -65,6 +93,7 @@ pub fn spawn(
             receiver_requests,
             device_io,
             dispatcher,
+            commands,
         ));
     });
 }
@@ -73,6 +102,7 @@ struct HostSwitchManagerState {
     sessions: Vec<RunningSession>,
     next_generation: u64,
     restart_after: Vec<(HostSwitchLink, Instant)>,
+    pending: Option<PendingCommand>,
 }
 
 impl HostSwitchManagerState {
@@ -81,6 +111,7 @@ impl HostSwitchManagerState {
             sessions: Vec::new(),
             next_generation: 0,
             restart_after: Vec::new(),
+            pending: None,
         }
     }
 
@@ -115,7 +146,7 @@ impl HostSwitchManagerState {
         } else {
             published.as_slice()
         };
-        stop_unwanted(&mut self.sessions, wanted).await;
+        stop_unwanted(&mut self.sessions, wanted, &mut self.pending).await;
         self.restart_after
             .retain(|(link, _)| published.contains(link));
         for link in wanted {
@@ -143,6 +174,87 @@ impl HostSwitchManagerState {
             ));
         }
     }
+
+    /// Apply one software-initiated switch. An armed session for the keyboard
+    /// is stopped with `Requested`, so the switch runs through the very same
+    /// completion path as a key press and replies from there; a keyboard with
+    /// no armed session is switched directly and answered here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the watcher's other manager entry points, which thread the same handles"
+    )]
+    async fn handle_command(
+        &mut self,
+        command: HostSwitchCommand,
+        requests: ReceiverRequestState,
+        links: &mut watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>,
+        channel_pool: &ChannelPool,
+        receiver_access: &ReceiverAccess,
+        device_io: &DeviceIoGate,
+        dispatcher: &ActionDispatcher,
+    ) {
+        if command.reply.is_closed() {
+            debug!(route = %command.keyboard, "host switch command reply already closed; skipping");
+            return;
+        }
+        if !device_io.allows_io() || self.pending.is_some() || requests.any() {
+            let _ = command.reply.send(Err(HostSwitchCommandError::Busy));
+            return;
+        }
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.link.keyboard == command.keyboard)
+        {
+            match session.stop.take() {
+                Some(stop) => {
+                    let generation = session.generation;
+                    let _ = stop.send(HostSwitchStopReason::Requested(command.host));
+                    self.pending = Some(PendingCommand {
+                        generation,
+                        reply: command.reply,
+                    });
+                }
+                None => {
+                    let _ = command.reply.send(Err(HostSwitchCommandError::Busy));
+                }
+            }
+            return;
+        }
+        // No armed session for this keyboard, but another keyboard's session
+        // may still be holding a shared receiver lease — `run_transition`
+        // below waits for the exclusive lease, and only this loop can stop a
+        // session, so those sessions must be released first or the watcher
+        // deadlocks on itself.
+        stop_all(
+            &mut self.sessions,
+            HostSwitchStopReason::Graceful,
+            &mut self.pending,
+        )
+        .await;
+        let link = links
+            .borrow()
+            .iter()
+            .find(|link| link.keyboard == command.keyboard)
+            .cloned()
+            .unwrap_or_else(|| HostSwitchLink {
+                keyboard_key: String::new(),
+                keyboard: command.keyboard.clone(),
+                targets: Vec::new(),
+                actions: HostSwitchActions::default(),
+            });
+        run_transition(
+            links,
+            channel_pool,
+            receiver_access,
+            dispatcher,
+            link,
+            command.host,
+            HostSwitchTrigger::Command,
+            Some(command.reply),
+        )
+        .await;
+    }
 }
 
 async fn manage(
@@ -152,6 +264,7 @@ async fn manage(
     mut receiver_requests: watch::Receiver<ReceiverRequestState>,
     mut device_io: DeviceIoGate,
     dispatcher: ActionDispatcher,
+    mut commands: mpsc::UnboundedReceiver<HostSwitchCommand>,
 ) {
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<SessionCompletion>();
     let mut state = HostSwitchManagerState::new();
@@ -186,32 +299,36 @@ async fn manage(
 
         tokio::select! {
             Some(completion) = done_rx.recv() => {
-                if let Some(index) = state.sessions
-                    .iter()
-                    .position(|session| session.generation == completion.generation)
+                match handle_completion(
+                    &mut state,
+                    &mut links,
+                    &channel_pool,
+                    &receiver_access,
+                    &dispatcher,
+                    &mut device_io,
+                    completion,
+                )
+                .await
                 {
-                    let completed = state.sessions.remove(index);
-                    let _ = completed.task.await;
-                    if let Some((link, host)) = completion.request {
-                        if !device_io.wait_until_allowed().await {
-                            return;
-                        }
-                        stop_all(&mut state.sessions, HostSwitchStopReason::Graceful).await;
-                        run_transition(
-                            &mut links,
-                            &channel_pool,
-                            &receiver_access,
-                            &dispatcher,
-                            link,
-                            host,
-                            HostSwitchTrigger::Key,
-                        )
-                        .await;
-                    } else if device_io.allows_io() {
-                        state.restart_after.push((completed.link, Instant::now() + RETRY_DELAY));
-                    }
-                    reconcile = true;
+                    CompletionOutcome::Shutdown => return,
+                    CompletionOutcome::NotFound => {}
+                    CompletionOutcome::Handled => reconcile = true,
                 }
+            }
+            Some(command) = commands.recv() => {
+                let requests = *receiver_requests.borrow();
+                state
+                    .handle_command(
+                        command,
+                        requests,
+                        &mut links,
+                        &channel_pool,
+                        &receiver_access,
+                        &device_io,
+                        &dispatcher,
+                    )
+                    .await;
+                reconcile = true;
             }
             result = links.changed() => {
                 if result.is_err() {
@@ -235,6 +352,181 @@ async fn manage(
             }
         }
     }
+}
+
+/// What [`handle_completion`] did with one session-done signal.
+enum CompletionOutcome {
+    /// The device-I/O producer disappeared while waiting to resume; the
+    /// watcher must shut down.
+    Shutdown,
+    /// The completion's generation no longer matches a running session, and
+    /// no pending command was parked against it either; nothing changed.
+    NotFound,
+    /// The completion was applied — a retry was queued, a transition ran, or
+    /// an orphaned pending command was answered directly.
+    Handled,
+}
+
+/// React to one finished host-switch session: apply the key press or
+/// software switch it observed (replying to any pending command for the same
+/// generation from the very same transition), or answer a pending command
+/// directly when the session ended without a press, and otherwise queue a
+/// retry.
+///
+/// A completion's session may already be gone from `state.sessions` by the
+/// time this runs — e.g. a *different* keyboard's completion ran
+/// [`stop_all`] first, or a reconcile swept it via `stop_unwanted`/`stop_all`
+/// (an exclusive request started, or this keyboard's link left the config).
+/// `spawn_session` always sends exactly one completion before its task
+/// returns, so that message reaching this function is the only chance left
+/// to answer a command parked against it — the not-found branch below
+/// handles exactly that, rather than ever leaving `state.pending` stranded.
+async fn handle_completion(
+    state: &mut HostSwitchManagerState,
+    links: &mut watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>,
+    channel_pool: &ChannelPool,
+    receiver_access: &ReceiverAccess,
+    dispatcher: &ActionDispatcher,
+    device_io: &mut DeviceIoGate,
+    completion: SessionCompletion,
+) -> CompletionOutcome {
+    let Some(index) = state
+        .sessions
+        .iter()
+        .position(|session| session.generation == completion.generation)
+    else {
+        return match state
+            .pending
+            .take_if(|pending| pending.generation == completion.generation)
+        {
+            Some(pending) => {
+                answer_orphaned_pending(
+                    &mut state.sessions,
+                    links,
+                    channel_pool,
+                    receiver_access,
+                    dispatcher,
+                    device_io,
+                    pending,
+                    completion.request,
+                )
+                .await
+            }
+            None => CompletionOutcome::NotFound,
+        };
+    };
+    let completed = state.sessions.remove(index);
+    await_session_task(completed.task, completed.generation, &mut state.pending).await;
+    if let Some((link, host)) = completion.request {
+        if !device_io.wait_until_allowed().await {
+            return CompletionOutcome::Shutdown;
+        }
+        stop_all(
+            &mut state.sessions,
+            HostSwitchStopReason::Graceful,
+            &mut state.pending,
+        )
+        .await;
+        // A parked command answers only from its own generation: matching by
+        // keyboard alone would risk handing its reply to a different,
+        // later-armed session for the same keyboard instead.
+        let pending = state
+            .pending
+            .take_if(|pending| pending.generation == completed.generation);
+        // A key press landing in the very same instant as a software command
+        // can still win the stopped session's own `select!` (see
+        // `run_host_switch_session`), so `pending` here can be `Some` even
+        // though a physical key is what actually produced this completion —
+        // the trigger and reply below then reflect the command, not the key,
+        // but both agree on the host that was actually reached.
+        let trigger = if pending.is_some() {
+            HostSwitchTrigger::Command
+        } else {
+            HostSwitchTrigger::Key
+        };
+        run_transition(
+            links,
+            channel_pool,
+            receiver_access,
+            dispatcher,
+            link,
+            host,
+            trigger,
+            pending.map(|pending| pending.reply),
+        )
+        .await;
+    } else {
+        if let Some(pending) = state
+            .pending
+            .take_if(|pending| pending.generation == completed.generation)
+        {
+            let _ = pending.reply.send(Err(HostSwitchCommandError::Io(
+                "host switch session ended before the switch was applied".into(),
+            )));
+        }
+        if device_io.allows_io() {
+            state
+                .restart_after
+                .push((completed.link, Instant::now() + RETRY_DELAY));
+        }
+    }
+    CompletionOutcome::Handled
+}
+
+/// Answer a `pending` command whose session generation left
+/// `state.sessions` before its completion could be matched there (see the
+/// not-found branch of [`handle_completion`]). Applies the exact same
+/// transition a still-tracked session's completion would have — including
+/// releasing every other session's receiver lease first, since this may
+/// still need the exclusive lease [`run_transition`] acquires.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors handle_completion's own parameter list, which it is a fallback branch of"
+)]
+async fn answer_orphaned_pending(
+    sessions: &mut Vec<RunningSession>,
+    links: &mut watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>,
+    channel_pool: &ChannelPool,
+    receiver_access: &ReceiverAccess,
+    dispatcher: &ActionDispatcher,
+    device_io: &mut DeviceIoGate,
+    pending: PendingCommand,
+    request: Option<(HostSwitchLink, u8)>,
+) -> CompletionOutcome {
+    match request {
+        Some((link, host)) => {
+            if !device_io.wait_until_allowed().await {
+                return CompletionOutcome::Shutdown;
+            }
+            // `pending` above is already this function's own `pending`
+            // argument (owned, not `state.pending`), so there is nothing
+            // else parked to strand here.
+            let mut nothing_pending = None;
+            stop_all(
+                sessions,
+                HostSwitchStopReason::Graceful,
+                &mut nothing_pending,
+            )
+            .await;
+            run_transition(
+                links,
+                channel_pool,
+                receiver_access,
+                dispatcher,
+                link,
+                host,
+                HostSwitchTrigger::Command,
+                Some(pending.reply),
+            )
+            .await;
+        }
+        None => {
+            let _ = pending.reply.send(Err(HostSwitchCommandError::Io(
+                "host switch session ended before the switch was applied".into(),
+            )));
+        }
+    }
+    CompletionOutcome::Handled
 }
 
 async fn wait_for_deadline(deadline: Option<Instant>) {
@@ -276,7 +568,7 @@ fn spawn_session(
     RunningSession {
         link,
         generation,
-        stop,
+        stop: Some(stop),
         task,
     }
 }
@@ -284,7 +576,7 @@ fn spawn_session(
 struct RunningSession {
     link: HostSwitchLink,
     generation: u64,
-    stop: oneshot::Sender<HostSwitchStopReason>,
+    stop: Option<oneshot::Sender<HostSwitchStopReason>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -293,31 +585,80 @@ struct SessionCompletion {
     request: Option<(HostSwitchLink, u8)>,
 }
 
-async fn stop_all(sessions: &mut Vec<RunningSession>, reason: HostSwitchStopReason) {
-    let running = std::mem::take(sessions);
-    let mut tasks = Vec::with_capacity(running.len());
-    for RunningSession { stop, task, .. } in running {
-        let _ = stop.send(reason);
-        tasks.push(task);
-    }
-    for task in tasks {
-        let _ = task.await;
+/// Await a stopped session's task. A [`JoinError`](tokio::task::JoinError)
+/// means the task panicked instead of sending its own completion, so a
+/// `pending` command parked against `generation` would otherwise wait
+/// forever behind [`HostSwitchManagerState::handle_command`]'s
+/// `self.pending.is_some()` gate — every later command answered `Busy` until
+/// restart. Answer it here instead, from the one place that knows the task
+/// will never complete normally.
+async fn await_session_task(
+    task: tokio::task::JoinHandle<()>,
+    generation: u64,
+    pending: &mut Option<PendingCommand>,
+) {
+    if let Err(join_error) = task.await {
+        warn!(%join_error, generation, "host switch session task panicked");
+        if let Some(pending) = pending.take_if(|pending| pending.generation == generation) {
+            let _ = pending.reply.send(Err(HostSwitchCommandError::Io(
+                "host switch session task panicked".into(),
+            )));
+        }
     }
 }
 
-async fn stop_unwanted(sessions: &mut Vec<RunningSession>, wanted: &[HostSwitchLink]) {
+async fn stop_all(
+    sessions: &mut Vec<RunningSession>,
+    reason: HostSwitchStopReason,
+    pending: &mut Option<PendingCommand>,
+) {
+    let running = std::mem::take(sessions);
+    let mut tasks = Vec::with_capacity(running.len());
+    for RunningSession {
+        stop,
+        task,
+        generation,
+        ..
+    } in running
+    {
+        if let Some(stop) = stop {
+            let _ = stop.send(reason);
+        }
+        tasks.push((generation, task));
+    }
+    for (generation, task) in tasks {
+        await_session_task(task, generation, pending).await;
+    }
+}
+
+async fn stop_unwanted(
+    sessions: &mut Vec<RunningSession>,
+    wanted: &[HostSwitchLink],
+    pending: &mut Option<PendingCommand>,
+) {
     let mut index = 0;
     while index < sessions.len() {
         if wanted.contains(&sessions[index].link) {
             index += 1;
             continue;
         }
-        let RunningSession { stop, task, .. } = sessions.remove(index);
-        let _ = stop.send(HostSwitchStopReason::Graceful);
-        let _ = task.await;
+        let RunningSession {
+            stop,
+            task,
+            generation,
+            ..
+        } = sessions.remove(index);
+        if let Some(stop) = stop {
+            let _ = stop.send(HostSwitchStopReason::Graceful);
+        }
+        await_session_task(task, generation, pending).await;
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the watcher's other manager entry points, which thread the same handles"
+)]
 async fn run_transition(
     links: &mut watch::Receiver<std::sync::Arc<Vec<HostSwitchLink>>>,
     channel_pool: &ChannelPool,
@@ -326,6 +667,7 @@ async fn run_transition(
     link: HostSwitchLink,
     host: u8,
     trigger: HostSwitchTrigger,
+    reply: Option<oneshot::Sender<Result<HostSwitchOutcome, HostSwitchCommandError>>>,
 ) {
     let _lease = receiver_access
         .acquire_exclusive(ExclusiveAccessReason::HostTransition)
@@ -335,12 +677,31 @@ async fn run_transition(
             debug!(host, route = %link.keyboard, "no host switch action configured for slot");
         }
     };
-    match switch_linked_hosts_with(&link.keyboard, &link.targets, host, channel_pool, fire).await {
+    let result =
+        switch_linked_hosts_with(&link.keyboard, &link.targets, host, channel_pool, fire).await;
+    if let Some(reply) = reply {
+        let _ = reply.send(outcome_of(&result));
+    }
+    match result {
         Ok(true) => wait_for_departure(links, &link.keyboard).await,
         Ok(false) => {}
         Err(error) => {
             debug!(%error, route = %link.keyboard, host, "keyboard host switch failed");
         }
+    }
+}
+
+/// Translate a switch result into the wire outcome.
+fn outcome_of(
+    result: &Result<bool, HostSwitchError>,
+) -> Result<HostSwitchOutcome, HostSwitchCommandError> {
+    match result {
+        Ok(true) => Ok(HostSwitchOutcome::Switched),
+        Ok(false) => Ok(HostSwitchOutcome::AlreadyCurrent),
+        Err(HostSwitchError::KeyboardNotFound) => Err(HostSwitchCommandError::KeyboardNotFound),
+        Err(HostSwitchError::HostSlotEmpty { .. }) => Err(HostSwitchCommandError::UnpairedSlot),
+        Err(HostSwitchError::InvalidHost { .. }) => Err(HostSwitchCommandError::InvalidSlot),
+        Err(error) => Err(HostSwitchCommandError::Io(error.to_string())),
     }
 }
 
@@ -408,6 +769,15 @@ mod tests {
         DeviceRoute::Bolt {
             receiver_uid: "cafe".to_owned(),
             slot,
+        }
+    }
+
+    fn link_for_route(slot: u8) -> HostSwitchLink {
+        HostSwitchLink {
+            keyboard_key: String::new(),
+            keyboard: route(slot),
+            targets: Vec::new(),
+            actions: HostSwitchActions::default(),
         }
     }
 
@@ -487,5 +857,298 @@ mod tests {
         )));
         assert!(env.contains(&("OPENLOGI_TRIGGER".to_string(), "key".to_string())));
         assert!(plan_slot_action(&link, 0, HostSwitchTrigger::Key).is_none());
+    }
+
+    fn test_dispatcher() -> (crate::runtime::ActionRuntime, ActionDispatcher) {
+        let (ring, _triggers) = mpsc::unbounded_channel();
+        let runtime = crate::runtime::ActionRuntime::new(
+            std::sync::Arc::new(std::sync::RwLock::new(crate::DpiCycles::default())),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            openlogi_hid::ChannelRegistry::default(),
+            ReceiverAccess::default(),
+            openlogi_hid::device_io_channel().1,
+            ring,
+        )
+        .expect("button worker starts");
+        let dispatcher = runtime.dispatcher();
+        (runtime, dispatcher)
+    }
+
+    #[test]
+    fn switch_results_map_to_wire_outcomes() {
+        use openlogi_core::hid::{HostSwitchCommandError, HostSwitchOutcome};
+        use openlogi_hid::HostSwitchError;
+        assert_eq!(outcome_of(&Ok(true)), Ok(HostSwitchOutcome::Switched));
+        assert_eq!(
+            outcome_of(&Ok(false)),
+            Ok(HostSwitchOutcome::AlreadyCurrent)
+        );
+        assert_eq!(
+            outcome_of(&Err(HostSwitchError::KeyboardNotFound)),
+            Err(HostSwitchCommandError::KeyboardNotFound)
+        );
+        assert_eq!(
+            outcome_of(&Err(HostSwitchError::HostSlotEmpty { host: 1 })),
+            Err(HostSwitchCommandError::UnpairedSlot)
+        );
+        assert_eq!(
+            outcome_of(&Err(HostSwitchError::InvalidHost {
+                host: 3,
+                host_count: 3
+            })),
+            Err(HostSwitchCommandError::InvalidSlot)
+        );
+        assert!(matches!(
+            outcome_of(&Err(HostSwitchError::UnsupportedKeyboard)),
+            Err(HostSwitchCommandError::Io(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_command_with_no_armed_session_and_no_keyboard_is_not_found() {
+        use openlogi_core::hid::HostSwitchCommandError;
+        let (links_tx, links) = watch::channel(std::sync::Arc::new(Vec::new()));
+        let _keep = links_tx;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut state = HostSwitchManagerState::new();
+        let (_, dispatcher) = test_dispatcher();
+        let mut links = links;
+        state
+            .handle_command(
+                HostSwitchCommand {
+                    keyboard: route(9),
+                    host: 1,
+                    reply: reply_tx,
+                },
+                ReceiverRequestState::default(),
+                &mut links,
+                &openlogi_hid::host::channel_pool(),
+                &ReceiverAccess::default(),
+                &openlogi_hid::device_io_channel().1,
+                &dispatcher,
+            )
+            .await;
+        assert_eq!(
+            reply_rx.await.expect("a reply is always sent"),
+            Err(HostSwitchCommandError::KeyboardNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_command_stops_armed_sessions_before_taking_the_exclusive_lease() {
+        use openlogi_core::hid::HostSwitchCommandError;
+        let receiver_access = ReceiverAccess::default();
+        let lease = receiver_access
+            .try_acquire_for_session()
+            .expect("a fresh ReceiverAccess should grant a session lease");
+        let (stop_tx, stop_rx) = oneshot::channel::<HostSwitchStopReason>();
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<SessionCompletion>();
+        let generation: u64 = 1;
+        let armed_link = HostSwitchLink {
+            keyboard_key: "armed".into(),
+            keyboard: route(1),
+            targets: Vec::new(),
+            actions: HostSwitchActions::default(),
+        };
+        // Stands in for `spawn_session`'s task: holds the shared receiver
+        // lease until told to stop, then reports a plain (no key observed)
+        // completion and drops the lease — exactly what an armed session
+        // does while idle.
+        let armed_task = tokio::spawn(async move {
+            let _lease = lease;
+            let _ = stop_rx.await;
+            let _ = done_tx.send(SessionCompletion {
+                generation,
+                request: None,
+            });
+        });
+        let mut state = HostSwitchManagerState::new();
+        state.sessions.push(RunningSession {
+            link: armed_link,
+            generation,
+            stop: Some(stop_tx),
+            task: armed_task,
+        });
+
+        let (links_tx, mut links) = watch::channel(std::sync::Arc::new(Vec::new()));
+        let _keep = links_tx;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_, dispatcher) = test_dispatcher();
+
+        // Without stopping the armed session first, `run_transition`'s
+        // `acquire_exclusive` would wait forever on the lease above, and
+        // only this very call could ever release it — a real deadlock, not
+        // just a slow path. Bound it so a regression fails instead of
+        // hanging the test suite.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            state.handle_command(
+                HostSwitchCommand {
+                    keyboard: route(9),
+                    host: 1,
+                    reply: reply_tx,
+                },
+                ReceiverRequestState::default(),
+                &mut links,
+                &openlogi_hid::host::channel_pool(),
+                &receiver_access,
+                &openlogi_hid::device_io_channel().1,
+                &dispatcher,
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "a direct command must release other sessions' receiver leases before \
+             waiting on the exclusive lease, not deadlock behind them"
+        );
+        assert_eq!(
+            reply_rx.await.expect("a reply is always sent"),
+            Err(HostSwitchCommandError::KeyboardNotFound)
+        );
+        assert!(
+            done_rx.recv().await.is_some(),
+            "the stopped armed session should still have reported its own completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_while_exclusive_receiver_access_is_requested() {
+        use openlogi_core::hid::HostSwitchCommandError;
+        // Hold pairing's exclusive request open so `requests.any()` is true —
+        // the same signal `manage` reads off `receiver_requests` before
+        // calling `handle_command`.
+        let receiver_access = ReceiverAccess::default();
+        let _pairing_lease = receiver_access
+            .acquire_exclusive(ExclusiveAccessReason::Pairing)
+            .await;
+        let requests = *receiver_access.subscribe_requests().borrow();
+        assert!(requests.any());
+
+        let (links_tx, mut links) = watch::channel(std::sync::Arc::new(Vec::new()));
+        let _keep = links_tx;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut state = HostSwitchManagerState::new();
+        let (_, dispatcher) = test_dispatcher();
+
+        state
+            .handle_command(
+                HostSwitchCommand {
+                    keyboard: route(1),
+                    host: 1,
+                    reply: reply_tx,
+                },
+                requests,
+                &mut links,
+                &openlogi_hid::host::channel_pool(),
+                &receiver_access,
+                &openlogi_hid::device_io_channel().1,
+                &dispatcher,
+            )
+            .await;
+
+        assert_eq!(
+            reply_rx.await.expect("a reply is always sent"),
+            Err(HostSwitchCommandError::Busy)
+        );
+        assert!(
+            state.sessions.is_empty(),
+            "no session should be touched while exclusive access is requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_pending_is_answered_when_its_completion_arrives_unmatched() {
+        use openlogi_core::hid::HostSwitchCommandError;
+        let receiver_access = ReceiverAccess::default();
+        let mut device_io = openlogi_hid::device_io_channel().1;
+        let (links_tx, mut links) = watch::channel(std::sync::Arc::new(Vec::new()));
+        let _keep = links_tx;
+        let (_, dispatcher) = test_dispatcher();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let generation: u64 = 7;
+        // No session for `generation` exists in `state.sessions` — it left
+        // the list (e.g. another keyboard's completion ran `stop_all`)
+        // before this, its own completion, was matched.
+        let mut state = HostSwitchManagerState::new();
+        state.pending = Some(PendingCommand {
+            generation,
+            reply: reply_tx,
+        });
+
+        let outcome = handle_completion(
+            &mut state,
+            &mut links,
+            &openlogi_hid::host::channel_pool(),
+            &receiver_access,
+            &dispatcher,
+            &mut device_io,
+            SessionCompletion {
+                generation,
+                request: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(outcome, CompletionOutcome::Handled));
+        assert_eq!(
+            reply_rx.await.expect("a reply is always sent"),
+            Err(HostSwitchCommandError::Io(
+                "host switch session ended before the switch was applied".into()
+            ))
+        );
+        assert!(
+            state.pending.is_none(),
+            "the answered pending command must not leave a stale Busy gate behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_pending_with_a_request_runs_the_transition() {
+        use openlogi_core::hid::HostSwitchCommandError;
+        let receiver_access = ReceiverAccess::default();
+        let mut device_io = openlogi_hid::device_io_channel().1;
+        let (links_tx, mut links) = watch::channel(std::sync::Arc::new(Vec::new()));
+        let _keep = links_tx;
+        let (_, dispatcher) = test_dispatcher();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let generation: u64 = 11;
+        // As in `orphaned_pending_is_answered_when_its_completion_arrives_unmatched`,
+        // no session for `generation` exists in `state.sessions` — but this
+        // completion carries a `request`, the same shape a stopped armed
+        // session reports when it observed a key press or command before
+        // exiting.
+        let mut state = HostSwitchManagerState::new();
+        state.pending = Some(PendingCommand {
+            generation,
+            reply: reply_tx,
+        });
+
+        let outcome = handle_completion(
+            &mut state,
+            &mut links,
+            &openlogi_hid::host::channel_pool(),
+            &receiver_access,
+            &dispatcher,
+            &mut device_io,
+            SessionCompletion {
+                generation,
+                request: Some((link_for_route(9), 1)),
+            },
+        )
+        .await;
+
+        assert!(matches!(outcome, CompletionOutcome::Handled));
+        assert_eq!(
+            reply_rx.await.expect("a reply is always sent"),
+            Err(HostSwitchCommandError::KeyboardNotFound),
+            "the orphaned pending command must still run the transition, not just \
+             answer generically — an unreachable route fails fast with the real error"
+        );
+        assert!(
+            state.pending.is_none(),
+            "the answered pending command must not leave a stale Busy gate behind"
+        );
     }
 }

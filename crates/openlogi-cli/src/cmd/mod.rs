@@ -7,6 +7,7 @@ pub mod assets;
 pub mod backlight;
 pub mod camera;
 pub mod diag;
+pub mod host;
 pub mod light;
 pub mod list;
 pub mod snapshot;
@@ -30,13 +31,17 @@ pub enum Command {
     /// Inspect and control standalone Logitech lights.
     #[command(subcommand)]
     Light(light::LightCmd),
+    /// Inspect and switch a keyboard's Easy-Switch host slots.
+    #[command(subcommand)]
+    Host(host::HostCmd),
 }
 
 impl Command {
     /// Dispatch the parsed subcommand and report the process exit status.
     ///
-    /// Only `list` reports a status of its own (nothing connected); every
-    /// other subcommand either succeeds or fails outright.
+    /// `list` and `host` report a status of their own (nothing connected;
+    /// agent unreachable, no keyboard matched, or a switch was refused);
+    /// every other subcommand either succeeds or fails outright.
     pub async fn run(self) -> Result<ExitCode> {
         match self {
             Self::List(args) => return list::run(args).await,
@@ -49,6 +54,7 @@ impl Command {
             Self::Assets(cmd) => cmd.run()?,
             Self::Diag(cmd) => cmd.run().await?,
             Self::Light(cmd) => cmd.run().await?,
+            Self::Host(cmd) => return cmd.run().await,
         }
         Ok(ExitCode::SUCCESS)
     }
