@@ -283,6 +283,30 @@ async fn probe_bolt_slot(
     Some((device, outcome))
 }
 
+/// Hybrid-peripheral discriminator: does this direct-channel probe represent
+/// a genuine directly-attached device (mouse, keyboard, …) rather than a Bolt
+/// receiver's secondary HID interface? A Bolt receiver's secondary interface
+/// also answers `DeviceInformation` at `0xff` but exposes neither a battery
+/// nor any configurable feature, so it would otherwise appear as a phantom
+/// second device and steal writes (see [`probe_direct`]'s comment).
+///
+/// A genuine peripheral is recognised when it reports a battery OR exposes a
+/// configurable feature (buttons / pointer / lighting) OR — added so that
+/// backlight keyboards aren't dropped — announces itself as a keyboard via
+/// `0x0005`. The lighting capability only covers RGB (`0x8070`/`0x8080`), so a
+/// backlight-only keyboard (`0x198x`, e.g. MX Keys S) has every capability
+/// flag false; without the kind check such a keyboard whose battery read
+/// transiently failed would be misclassified as a receiver secondary interface
+/// and dropped.
+fn is_direct_peripheral(probe: &ProbedFeatures) -> bool {
+    let caps = probe.capabilities.unwrap_or_default();
+    probe.battery.is_some()
+        || caps.buttons
+        || caps.pointer
+        || caps.lighting
+        || probe.kind == Some(DeviceKind::Keyboard)
+}
+
 /// Probe a HID++ channel that doesn't host a Bolt receiver — for
 /// Bluetooth-direct, USB-C, or otherwise wired devices that present
 /// themselves as a HID++ device rather than a receiver (P2.4).
@@ -321,8 +345,7 @@ async fn probe_direct(
     // settled as a failed probe and its last inventory replayed.
     let capabilities = probe.capabilities;
     let walk_succeeded = capabilities.is_some();
-    let caps = capabilities.unwrap_or_default();
-    let is_peripheral = probe.battery.is_some() || caps.buttons || caps.pointer || caps.lighting;
+    let is_peripheral = is_direct_peripheral(&probe);
     if !is_peripheral {
         debug!(
             vid = format_args!("{:04x}", info.vendor_id),
@@ -494,4 +517,86 @@ async fn read_codename(channel: &HidppChannel, slot: u8) -> Option<String> {
     core::str::from_utf8(&response[3..3 + len])
         .ok()
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use openlogi_core::device::{Capabilities, DeviceKind};
+
+    use super::{ProbedFeatures, is_direct_peripheral};
+
+    /// A device that reports a battery is always a peripheral.
+    #[test]
+    fn battery_alone_makes_peripheral() {
+        let probe = ProbedFeatures {
+            kind: None,
+            capabilities: Some(Capabilities::default()),
+            ..with_battery()
+        };
+        assert!(is_direct_peripheral(&probe));
+    }
+
+    /// A mouse (buttons + pointer) with no battery is a peripheral.
+    #[test]
+    fn mouse_capabilities_make_peripheral() {
+        let probe = ProbedFeatures {
+            battery: None,
+            kind: None,
+            capabilities: Some(Capabilities {
+                buttons: true,
+                pointer: true,
+                ..Capabilities::default()
+            }),
+            model_info: None,
+        };
+        assert!(is_direct_peripheral(&probe));
+    }
+
+    /// A Bolt receiver's secondary HID interface — no battery, no config
+    /// feature, no keyboard kind — must be rejected.
+    #[test]
+    fn receiver_secondary_interface_is_rejected() {
+        let probe = ProbedFeatures {
+            battery: None,
+            kind: None,
+            capabilities: Some(Capabilities::default()),
+            model_info: None,
+        };
+        assert!(!is_direct_peripheral(&probe));
+    }
+
+    /// REGRESSION (MX Keys S): a backlight keyboard has no RGB lighting
+    /// capability (`lighting=false`), no buttons, no pointer; if its battery
+    /// read also failed (`battery=None`), the old discriminator dropped it as a
+    /// "receiver secondary interface". The keyboard kind (`0x0005`) must keep
+    /// it recognised as a peripheral.
+    #[test]
+    fn backlight_keyboard_without_battery_is_peripheral() {
+        let probe = ProbedFeatures {
+            battery: None,
+            kind: Some(DeviceKind::Keyboard),
+            // backlight-only keyboard: no RGB lighting, no buttons/pointer.
+            capabilities: Some(Capabilities::default()),
+            model_info: None,
+        };
+        assert!(
+            is_direct_peripheral(&probe),
+            "a keyboard must be recognised as a peripheral even with no battery and no RGB lighting"
+        );
+    }
+
+    // Helper constructors so the tests above read at intent-level.
+    fn with_battery() -> ProbedFeatures {
+        use openlogi_core::device::{BatteryInfo, BatteryLevel, BatteryStatus};
+        ProbedFeatures {
+            battery: Some(BatteryInfo {
+                percentage: 50,
+                level: BatteryLevel::Good,
+                status: BatteryStatus::Discharging,
+            }),
+            model_info: None,
+            kind: None,
+            capabilities: None,
+        }
+    }
 }
